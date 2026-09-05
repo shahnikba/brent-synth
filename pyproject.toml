@@ -15,6 +15,9 @@ dependencies = [
     "matplotlib>=3.11.1",
 ]
 
+[project.scripts]
+brent-synth-backtest = "brent_synth.backtest:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",

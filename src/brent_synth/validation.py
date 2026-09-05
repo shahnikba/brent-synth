@@ -738,6 +738,9 @@ def make_report(
  code {{ background: #f2f2f2; padding: .1rem .3rem; }}
 </style></head><body>
 <h1>Brent synthetic-path validation</h1>
+<p><i>The in-sample descriptive check on the champion fitted to all data. The
+out-of-time comparison that selected it is in
+<a href="model_comparison.html">model_comparison.html</a>.</i></p>
 <p class="summary"><b>{n_pass} of {n_total}</b> independent statistics fall inside
 the real bootstrap band, and <b>{n_wide}</b> show a spread outside
 {DISPERSION_BOUNDS[0]:g}-{DISPERSION_BOUNDS[1]:g}x the real one. Synthetic paths come
@@ -904,6 +907,10 @@ def make_markdown_report(
     seed_text = "not recorded" if seed is None else str(seed)
     low, high = DISPERSION_BOUNDS
     document = f"""# Brent synthetic-path validation
+
+*The in-sample descriptive check on the champion fitted to all data. The
+out-of-time comparison that selected it is in
+[model_comparison.md](model_comparison.md).*
 
 **{n_pass} of {n_total}** independent statistics fall inside the real bootstrap
 band, and **{n_wide}** show a spread outside {low:g}-{high:g}x the real one.
