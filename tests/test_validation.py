@@ -6,6 +6,8 @@ GJR-GARCH path simulated from fixed parameters, which gives a stand-in
 keeps the bootstrap fast and the results deterministic.
 """
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -290,8 +292,15 @@ def test_report_is_byte_identical_across_runs(
 def test_run_validation_end_to_end(tmp_path) -> None:
     """Smoke test of the whole pipeline, at reduced size."""
     out = tmp_path / "pipeline.html"
+    # markdown_path must be given explicitly: its default points into the
+    # project's reports/ directory, and a test must not write there.
     path = run_validation(
-        seed=42, horizon=60, n_paths=150, n_boot=150, out_path=str(out)
+        seed=42,
+        horizon=60,
+        n_paths=150,
+        n_boot=150,
+        out_path=str(out),
+        markdown_path=str(tmp_path / "pipeline_smoke.md"),
     )
     assert path == str(out)
     assert out.stat().st_size > 20_000
@@ -609,3 +618,32 @@ def test_markdown_can_be_skipped(tmp_path) -> None:
     )
     assert html_out.exists()
     assert not list(tmp_path.glob("*.md"))
+
+
+def test_tests_never_write_into_the_project_reports_directory(tmp_path) -> None:
+    """Guard the footgun that overwrote reports/validation.md.
+
+    run_validation's out_path and markdown_path default into reports/.
+    Passing only one of them sends the other into the project tree, where
+    a reduced-size test run silently replaced the real report.
+    """
+    project_reports = Path("reports")
+    before = (
+        {p.name: p.stat().st_mtime for p in project_reports.iterdir()}
+        if project_reports.is_dir()
+        else {}
+    )
+    run_validation(
+        seed=1,
+        horizon=60,
+        n_paths=60,
+        n_boot=60,
+        out_path=str(tmp_path / "a.html"),
+        markdown_path=str(tmp_path / "a.md"),
+    )
+    after = (
+        {p.name: p.stat().st_mtime for p in project_reports.iterdir()}
+        if project_reports.is_dir()
+        else {}
+    )
+    assert before == after
