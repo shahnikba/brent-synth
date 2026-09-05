@@ -1,0 +1,14 @@
+# Data — never commit
+data/
+*.csv
+*.parquet
+reports/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Environments
+.venv/
