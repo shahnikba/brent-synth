@@ -16,11 +16,13 @@ document that names interfaces, invariants, tests and a "done when"
 condition; five were written (data, diagnostics, model, validation, and
 the model ladder with temporal validation) plus three follow-ups.
 
-**Claude Code (session named "Brian") — implementer.** *[confirm]* It
-implemented each spec, wrote the tests the spec required and additional
-ones it judged necessary, and returned a written report per spec listing
-status, test counts, deviations from the spec, and defects found. Those
-reports were the input to the next design discussion.
+**Claude Code — implementer.** I call this session "Brian". It only
+implements: it is given a spec and writes the code and tests for it, and
+it makes no modelling or methodological decisions. It implemented each
+spec, wrote the tests the spec required and additional ones it judged
+necessary, and returned a written report per spec listing status, test
+counts, deviations from the spec, and defects found. Those reports were
+the input to the next design discussion.
 
 I sat between the two: I set the objectives, made every modelling and
 methodological decision, reviewed each report, and decided what to keep,
@@ -73,12 +75,18 @@ I did not take generated code or generated numbers on trust.
   the original `model.simulate` output under `np.array_equal`.
 - **Independent formulas.** CRPS is checked against the Gaussian closed
   form; Kupiec against an LR computed separately in the test.
-- **Reading the code.** I reviewed every module for the things that are
-  silent when wrong: the percent/raw unit boundary in `model.py`, the
-  per-path versus pooled statistics in `validation.py`, the adjacency
-  handling in all three.
+- **Reading the code.** I read the implementation of `data.py`,
+  `diagnostics.py`, `model.py` and `validation.py` and checked it against
+  what the spec asked for, looking for the things that are silent when
+  wrong: the percent/raw unit boundary in `model.py`, the per-path versus
+  pooled statistics in `validation.py`, the adjacency handling in all
+  three. This was done early. I did not read the later modules — the
+  candidate ladder, `scoring.py`, `backtest.py` and the report
+  generators — line by line, for lack of time. Those rest on the
+  automated checks above rather than on my own reading, and that is a
+  real limit on how much of this code I have personally verified.
 
-216 tests pass at submission.
+218 tests pass at submission.
 
 ## Where the AI was wrong, and what I did about it
 
@@ -118,8 +126,16 @@ Listing these matters more than the list of what went right.
   chat model believed but could not verify without the data (which years
   had the largest single-day moves, whether the real ACF is still
   positive at lag 20). These were marked `[check]` in the draft and
-  confirmed or corrected against the diagnostics output before use.
-  *[confirm each was resolved]*
+  confirmed or corrected against a rerun of `diagnostics.run_all` before
+  use. All four were resolved and three changed the prose: the
+  autocorrelation of squared returns is still positive at lag 20
+  (+0.082); the mean-excess function on losses rises rather than being
+  flat (slope +0.27 over the top fifth of thresholds); the observation
+  count fell from 4754 to 4753 and the Ljung–Box p-value from 1.7e−213
+  to 1.9e−213 after the provisional-bar fix; and the gain tail's index
+  of 7.9 was withdrawn entirely, because the significance gate added
+  later found ξ/se = 1.25, short of the 95% mark. The corrections are
+  listed in `docs/specs/25-report-6-packaging.md`.
 
 ## What the prose is
 
@@ -133,14 +149,27 @@ and can defend it. I have not presented the drafting as unaided.
 
 ## What was not done with AI
 
-Data ingestion and caching, repository setup, the choice of the 4-Xtra
-brief's Brent series, and the decision of what to submit were done
-without AI assistance. *[edit to match]*
+Repository setup, the choice of the 4-Xtra brief's Brent series, and the
+decision of what to submit were done without AI assistance. So was the
+design of the pipeline itself: the shape of the validation, the decision
+to make it temporal rather than in-sample only, and the structure of the
+out-of-time comparison were mine. The AI implemented that design; it did
+not choose it.
+
+An earlier draft of this section also claimed data ingestion and caching
+were done without AI. That is not correct and I have removed it.
+`data.py` — the fetch, the log-return calculation and the parquet cache —
+was written by the implementer session against SPEC 1, and three
+cache-lifecycle defects in it were fixed against a later review. What is
+true is that I read that code manually and checked it was implemented
+correctly, which is a different claim and the one I am making.
 
 ## Reproducibility of the AI trail
 
 Specs and implementer reports are kept under `docs/specs/` in the order
-they were written. *[confirm path]* The pre-registration file carries a
+they were written: six specs, three follow-ups, four defect reviews and
+every report returned against them, numbered 01–25 with an index. The
+pre-registration file carries a
 hash of the scoring plan and is committed before the results commit;
 tags `spec5-preregistered` and `spec5-run` mark the two. Git cannot prove
 the ordering of commits made in one session, and I do not claim it does.
