@@ -16,6 +16,7 @@ import pandas as pd
 from arch import arch_model
 
 from brent_synth import model as gjr
+from brent_synth.candidates.arch_backed import filtered_sigma
 from brent_synth.candidates.base import (
     DensityForecast,
     LocationScaleForecast,
@@ -25,38 +26,6 @@ from brent_synth.candidates.base import (
 )
 
 PERCENT = gjr.PERCENT
-
-
-def filtered_sigma(
-    train: pd.Series,
-    realised: pd.Series,
-    params_percent: pd.Series,
-    vol: str = "GARCH",
-    dist: str = "skewt",
-    **vol_kwargs: object,
-) -> np.ndarray:
-    """Conditional volatilities for ``realised``, parameters frozen.
-
-    The whole point of the exercise is that day t's density may use only
-    the returns before day t. arch's ``fix`` runs the variance recursion
-    over a series without re-estimating anything, so filtering the
-    concatenated sample and keeping the tail gives exactly the
-    one-step-ahead volatilities: each sigma_t is built from returns up to
-    t-1, and the parameters came from the training sample alone.
-    """
-    combined = pd.concat([pd.Series(train).reset_index(drop=True),
-                          pd.Series(realised).reset_index(drop=True)],
-                         ignore_index=True)
-    spec = arch_model(
-        combined.to_numpy() * PERCENT,
-        mean="Constant",
-        vol=vol,
-        dist=dist,
-        **vol_kwargs,
-    )
-    fixed = spec.fix(params_percent)
-    sigma_percent = np.asarray(fixed.conditional_volatility)[-len(realised):]
-    return sigma_percent / PERCENT
 
 
 class FittedGjrSkewT:
@@ -69,6 +38,11 @@ class FittedGjrSkewT:
         self.loglik = fit.loglik
         self._train = pd.Series(np.asarray(train, dtype="float64"))
 
+    @property
+    def forecast_variance(self) -> float:
+        """sigma^2_{T+1}: the variance day one of the test window opens at."""
+        return self.fit.forecast_variance
+
     def simulate(self, horizon: int, n_paths: int, seed: int) -> np.ndarray:
         check_simulate_args(horizon, n_paths)
         return gjr.simulate(
@@ -80,16 +54,14 @@ class FittedGjrSkewT:
         )
 
     def forecast_density(self, realised: pd.Series) -> DensityForecast:
-        sigma = filtered_sigma(
+        sigma, binding = filtered_sigma(
             self._train,
             realised,
             self.fit.result.params,
-            vol="GARCH",
             dist="skewt",
-            p=1,
-            o=1,
-            q=1,
+            spec_kwargs={"vol": "GARCH", "p": 1, "o": 1, "q": 1},
         )
+        self.variance_bounds_binding = binding
         return LocationScaleForecast(
             mu=np.full(len(realised), self.params["mu"]),
             sigma=sigma,

@@ -58,6 +58,70 @@ def _to_raw(name: str, value: float) -> float:
     return value
 
 
+def filtered_sigma(
+    train: pd.Series,
+    realised: pd.Series,
+    params_percent: pd.Series,
+    dist: str,
+    spec_kwargs: dict,
+) -> tuple[np.ndarray, bool]:
+    """One-step-ahead conditional volatilities for ``realised``, leak-free.
+
+    Returns ``(sigma_raw, bounds_binding)``.
+
+    The obvious implementation — build the model on the concatenated
+    sample and call ``.fix()`` — has a subtle flaw: ``fix`` derives its
+    variance backcast from *all* the residuals it is handed, so the
+    starting value of the recursion is computed partly from the test
+    data. Its influence decays geometrically and is immaterial thousands
+    of steps later, but "immaterial" is not "absent", and this is an
+    out-of-time experiment.
+
+    arch's ``fix`` takes no ``backcast`` argument (``fit`` does, but that
+    re-estimates), so the recursion is driven directly instead: the
+    backcast comes from the **training residuals only**, and
+    ``compute_variance`` — the same call ``fix`` makes internally — walks
+    the combined series from there. Day one then opens at exactly the
+    one-step-ahead variance the training fit ended on, which a test
+    asserts bit-for-bit.
+
+    ``var_bounds`` are loose clipping bounds arch uses to keep the
+    likelihood finite; they are computed over the combined residuals
+    because the array must span them. The second return value reports
+    whether they ever actually bound — if they never do, no information
+    passes through them either.
+    """
+    train_percent = np.asarray(train, dtype="float64") * PERCENT
+    combined_percent = np.concatenate(
+        [train_percent, np.asarray(realised, dtype="float64") * PERCENT]
+    )
+    spec = arch_model(
+        combined_percent, mean="Constant", dist=dist, **spec_kwargs
+    )
+    volatility = spec.volatility
+
+    mu = float(params_percent["mu"])
+    resid_train = train_percent - mu
+    resid_all = combined_percent - mu
+
+    backcast = volatility.backcast(resid_train)
+    var_bounds = volatility.variance_bounds(resid_all)
+    vol_params = np.asarray(params_percent, dtype="float64")[
+        1 : 1 + volatility.num_params
+    ]
+
+    sigma2 = np.zeros(resid_all.size, dtype="float64")
+    volatility.compute_variance(
+        vol_params, resid_all, sigma2, backcast, var_bounds
+    )
+
+    binding = bool(
+        np.any(sigma2 <= var_bounds[:, 0]) or np.any(sigma2 >= var_bounds[:, 1])
+    )
+    n = len(realised)
+    return np.sqrt(sigma2[-n:]) / PERCENT, binding
+
+
 class FittedArchCandidate:
     def __init__(
         self,
@@ -124,13 +188,14 @@ class FittedArchCandidate:
         return out
 
     def forecast_density(self, realised: pd.Series) -> DensityForecast:
-        combined = np.concatenate(
-            [np.asarray(self._train), np.asarray(realised, dtype="float64")]
+        sigma, binding = filtered_sigma(
+            self._train,
+            realised,
+            self.params_percent,
+            self._dist,
+            self._spec_kwargs,
         )
-        fixed = self._spec(combined * PERCENT).fix(self.params_percent)
-        sigma = (
-            np.asarray(fixed.conditional_volatility)[-len(realised):] / PERCENT
-        )
+        self.variance_bounds_binding = binding
         return LocationScaleForecast(
             mu=np.full(len(realised), self.params["mu"]),
             sigma=sigma,

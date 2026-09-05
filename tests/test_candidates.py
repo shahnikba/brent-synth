@@ -246,3 +246,52 @@ def test_mixture_rejects_bad_weights() -> None:
         MixtureForecast(
             np.array([[0.3, 0.3]]), np.zeros((1, 2)), np.ones((1, 2))
         )
+
+
+# --- backcast leak ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["garch_normal", "gjr_skewt", "figarch_skewt"])
+def test_day_one_opens_at_the_train_only_forecast_variance(
+    fitted_all: dict, test_window: pd.Series, name: str
+) -> None:
+    """The filtered density must start exactly where the training fit ended.
+
+    arch's ``fix`` derives its variance backcast from every residual it
+    is handed, which on a concatenated sample means the test data helps
+    choose the starting value. Driving ``compute_variance`` with a
+    backcast taken from the training residuals alone removes that by
+    construction, and day one then equals sigma^2_{T+1} to machine
+    precision — bit-for-bit where both sides share arithmetic, one ulp
+    apart where one comes through the raw-unit path in ``model.py``.
+    """
+    fitted = fitted_all[name]
+    forecast = fitted.forecast_density(test_window)
+    assert forecast.sigma[0] ** 2 == pytest.approx(
+        fitted.forecast_variance, rel=1e-14
+    )
+    assert fitted.variance_bounds_binding is False
+
+
+@pytest.mark.parametrize("name", ["garch_normal", "gjr_skewt", "figarch_skewt"])
+def test_filtered_density_start_ignores_the_test_window(
+    fitted_all: dict, test_window: pd.Series, name: str
+) -> None:
+    """Scaling the realised returns must not move where day one opens."""
+    fitted = fitted_all[name]
+    perturbed = test_window * 3.0
+    assert (
+        fitted.forecast_density(test_window).sigma[0]
+        == fitted.forecast_density(perturbed).sigma[0]
+    )
+
+
+def test_filtered_sigma_follows_the_realised_path(
+    fitted_all: dict, test_window: pd.Series
+) -> None:
+    """Later days must respond to the realised returns — else it is inert."""
+    fitted = fitted_all["gjr_skewt"]
+    calm = fitted.forecast_density(test_window).sigma
+    shocked = test_window.copy()
+    shocked.iloc[0] = -0.15
+    assert fitted.forecast_density(shocked).sigma[1] > calm[1]
