@@ -163,3 +163,11 @@ to the cached data with a warning rather than raising. Yahoo's
 provisional final bar — the live quote published as a complete daily row,
 identifiable by a volume copied from the previous day — is detected and
 dropped, so an intraday tick is never cached as a settlement.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Shahram Nikbakhtian.
+
+The Brent price data itself is not covered by this licence and is not
+redistributed: it is fetched at runtime from Yahoo Finance and is subject
+to their terms.
