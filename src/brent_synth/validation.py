@@ -758,6 +758,7 @@ the count above.</p>
 <tr><td class="stat">Bootstrap replicates</td><td>{n_boot}</td></tr>
 <tr><td class="stat">Bootstrap block (expected days)</td><td>{block}</td></tr>
 <tr><td class="stat">Simulation seed</td><td>{html.escape(seed_text)}</td></tr>
+<tr><td class="stat">Bootstrap seed</td><td>{boot_seed}</td></tr>
 {params_rows}
 <tr><td class="stat">persistence (α + γ·E[z²1{{z&lt;0}}] + β)</td><td>{fit.persistence:.6f}</td></tr>
 <tr><td class="stat">leverage weight E[z²1{{z&lt;0}}]</td><td>{fit.leverage_weight:.6f}</td></tr>
