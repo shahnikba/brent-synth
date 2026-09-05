@@ -13,6 +13,8 @@ from scipy import stats
 
 from brent_synth.data import load_returns
 from brent_synth.diagnostics import (
+    MIN_OBS_MOMENTS,
+    XI_SIGNIFICANCE_Z,
     acf_returns,
     acf_squared,
     hill_estimator,
@@ -100,6 +102,7 @@ def test_pot_gpd_fit_reports_a_heavy_tail(returns: pd.Series, tail: str) -> None
     assert set(result) == {
         "threshold",
         "xi",
+        "xi_se",
         "beta",
         "n_exceedances",
         "tail_index",
@@ -108,7 +111,25 @@ def test_pot_gpd_fit_reports_a_heavy_tail(returns: pd.Series, tail: str) -> None
     assert result["beta"] > 0.0
     assert result["n_exceedances"] > 0
     assert result["xi"] > 0.0
-    assert result["tail_index"] > 0.0
+    assert result["xi_se"] > 0.0
+
+
+def test_only_the_left_tail_supports_a_tail_index(returns: pd.Series) -> None:
+    """Both tails fit xi > 0, but only the left one significantly so.
+
+    Left: xi/se ~ 1.87, past the one-sided 95% mark, so 1/xi is reported.
+    Right: xi/se ~ 1.25, short of it, so the tail index is withheld
+    rather than dressed up as a number the data cannot support.
+    """
+    left = pot_gpd_fit(returns, tail="left")
+    right = pot_gpd_fit(returns, tail="right")
+
+    assert left["xi"] > XI_SIGNIFICANCE_Z * left["xi_se"]
+    assert left["tail_index"] == pytest.approx(1.0 / left["xi"])
+
+    assert right["xi"] > 0.0
+    assert right["xi"] <= XI_SIGNIFICANCE_Z * right["xi_se"]
+    assert np.isnan(right["tail_index"])
 
 
 def test_pot_threshold_tracks_the_quantile(returns: pd.Series) -> None:
@@ -150,8 +171,10 @@ def test_run_all_is_populated(returns: pd.Series) -> None:
         block = result["tails"][tail]
         assert set(block) == {"hill", "pot_gpd", "mean_excess"}
         assert block["hill"]["alpha"].size > 0
-        assert block["pot_gpd"]["tail_index"] > 0.0
+        assert block["pot_gpd"]["xi"] > 0.0
         assert block["mean_excess"]["thresholds"].size > 0
+    # Only the left tail clears the significance bar; see the dedicated test.
+    assert result["tails"]["left"]["pot_gpd"]["tail_index"] > 0.0
 
 
 # --- estimator recovery ----------------------------------------------------
@@ -202,3 +225,131 @@ def test_gpd_recovers_a_known_shape() -> None:
     result = pot_gpd_fit(sample, tail="left", threshold_quantile=0.95)
     assert result["xi"] == pytest.approx(true_xi, abs=0.08)
     assert result["tail_index"] == pytest.approx(1.0 / true_xi, rel=0.4)
+
+
+# --- regression tests for reported defects ---------------------------------
+
+
+def test_mean_excess_uses_values_not_positions() -> None:
+    """Tied observations must not be counted as their own exceedances.
+
+    Taking everything positionally after the threshold includes the ties,
+    each contributing zero excess. On [1, 2, 2, 2, 5] that gave
+    [1.75, 1.0, 1.5, 3.0] instead of the defined [1.75, 3, 3, 3].
+    """
+    losses = pd.Series([-1.0, -2.0, -2.0, -2.0, -5.0])
+    result = mean_excess(losses, tail="left")
+    assert np.allclose(result["thresholds"], [1.0, 2.0, 2.0, 2.0])
+    assert np.allclose(result["mean_excess"], [1.75, 3.0, 3.0, 3.0])
+
+
+def test_mean_excess_matches_the_definition_directly() -> None:
+    """Brute-force E[X - u | X > u] against the vectorised form."""
+    rng = np.random.default_rng(4)
+    sample = np.round(rng.exponential(1.0, 400), 2)  # rounding forces ties
+    result = mean_excess(pd.Series(-sample), tail="left")
+    for threshold, value in zip(result["thresholds"], result["mean_excess"]):
+        above = sample[sample > threshold]
+        assert value == pytest.approx((above - threshold).mean())
+
+
+def test_mean_excess_omits_the_maximum(returns: pd.Series) -> None:
+    result = mean_excess(returns, tail="left")
+    losses = -returns[returns < 0].to_numpy()
+    assert result["thresholds"].max() < losses.max()
+
+
+def test_mean_excess_rejects_a_constant_tail() -> None:
+    with pytest.raises(ValueError, match="identical"):
+        mean_excess(pd.Series([-2.0] * 30), tail="left")
+
+
+@pytest.mark.parametrize("noise", [0.0, 1e-15, 1e-13, 1e-11])
+def test_hill_returns_nan_on_degenerate_input(noise: float) -> None:
+    """Near-constant losses must not yield a colossal alpha.
+
+    The old guard tested the mean log excess against exact zero; on
+    near-constant input it lands just above and slipped through,
+    reporting alpha ~ 1e15 as though it were a tail index.
+    """
+    rng = np.random.default_rng(0)
+    losses = 1.0 + rng.normal(0.0, noise, 200) if noise else np.ones(200)
+    result = hill_estimator(pd.Series(-losses), tail="left")
+    assert np.isnan(result["alpha"]).all()
+
+
+def test_tail_index_is_withheld_when_xi_is_insignificant() -> None:
+    """Exponential losses have no power-law tail; say so with NaN."""
+    for seed in (4, 6):
+        rng = np.random.default_rng(seed)
+        sample = pd.Series(-rng.exponential(0.02, 5000))
+        result = pot_gpd_fit(sample, tail="left")
+        assert result["xi"] > 0.0  # noises above zero
+        assert result["xi"] <= XI_SIGNIFICANCE_Z * result["xi_se"]
+        assert np.isnan(result["tail_index"])
+
+
+def test_xi_standard_error_matches_the_asymptotic_form(returns: pd.Series) -> None:
+    result = pot_gpd_fit(returns, tail="left")
+    expected = (1.0 + result["xi"]) / np.sqrt(result["n_exceedances"])
+    assert result["xi_se"] == pytest.approx(expected)
+
+
+def test_threshold_quantile_is_of_the_tail_not_the_returns(
+    returns: pd.Series,
+) -> None:
+    """Document the sharp edge: 0.95 of losses is ~2.4% of all returns."""
+    result = pot_gpd_fit(returns, tail="left", threshold_quantile=0.95)
+    losses = -returns[returns < 0].to_numpy()
+    assert result["threshold"] == pytest.approx(np.quantile(losses, 0.95))
+
+    overall_tail_probability = float((returns < -result["threshold"]).mean())
+    assert overall_tail_probability < 0.05  # not the 5% the name suggests
+    assert result["n_exceedances"] == int((losses > result["threshold"]).sum())
+
+
+def test_order_dependent_stats_refuse_to_splice_gaps() -> None:
+    """Dropping a NaN run makes its two sides lag-1 neighbours."""
+    rng = np.random.default_rng(0)
+    values = rng.normal(size=2000)
+    values[900:1000] = np.nan
+    gapped = pd.Series(values)
+
+    for call in (acf_returns, acf_squared, ljung_box_squared):
+        with pytest.raises(ValueError, match="non-finite"):
+            call(gapped)
+
+    # Order-independent statistics are unaffected and still work.
+    assert np.isfinite(moments(gapped)["std"])
+
+
+def test_acf_rejects_more_lags_than_the_sample_supports() -> None:
+    """statsmodels truncates silently; the caller must be told instead."""
+    short = pd.Series(np.random.default_rng(0).normal(size=10))
+    for call in (acf_returns, acf_squared):
+        with pytest.raises(ValueError, match="needs more than"):
+            call(short, nlags=50)
+    assert acf_returns(short, nlags=5).shape == (6,)
+
+
+def test_ljung_box_rejects_too_many_lags() -> None:
+    short = pd.Series(np.random.default_rng(0).normal(size=10))
+    with pytest.raises(ValueError, match="needs more than"):
+        ljung_box_squared(short, lags=50)
+
+
+def test_moments_rejects_too_few_observations() -> None:
+    """A 1-point series raised nothing and returned NaNs; be consistent."""
+    with pytest.raises(ValueError, match="at least 4 observations"):
+        moments(pd.Series([0.01]))
+    with pytest.raises(ValueError, match="empty"):
+        moments(pd.Series([], dtype="float64"))
+    assert np.isfinite(moments(pd.Series([0.01, -0.02, 0.03, -0.01]))["skew"])
+    assert MIN_OBS_MOMENTS == 4
+
+
+def test_moments_returns_plain_floats(returns: pd.Series) -> None:
+    result = moments(returns)
+    for name, value in result.items():
+        expected = int if name == "n_obs" else float
+        assert type(value) is expected, name

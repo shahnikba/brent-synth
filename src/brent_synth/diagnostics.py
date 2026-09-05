@@ -23,6 +23,23 @@ from statsmodels.tsa.stattools import acf
 
 TRADING_DAYS = 252
 
+#: Fewest observations for which every moment exists. Sample skew needs
+#: 3 and unbiased kurtosis needs 4, so below this ``moments`` would
+#: return NaNs rather than numbers.
+MIN_OBS_MOMENTS = 4
+
+#: Floor on the Hill estimator's mean log excess. Below this the top-k
+#: losses are numerically indistinguishable and the reciprocal is not a
+#: tail index but a division by noise — a real tail index is single or
+#: low double digits, so anything implying alpha > 1e6 is degenerate.
+#: Testing against exact zero does not close this: near-constant input
+#: lands just above zero and slips through.
+MIN_MEAN_LOG_EXCESS = 1e-6
+
+#: One-sided normal critical value at 95%, used to decide whether the
+#: fitted GPD shape is distinguishable from zero.
+XI_SIGNIFICANCE_Z = 1.645
+
 #: Smallest number of order statistics used by the Hill estimator. Below
 #: roughly this many exceedances the estimate is too noisy to read.
 HILL_MIN_K = 10
@@ -33,11 +50,47 @@ HILL_MAX_FRACTION = 0.10
 
 
 def _as_array(returns: pd.Series | np.ndarray) -> np.ndarray:
-    """Coerce a return series to a finite 1-D float array."""
+    """Coerce a return series to a finite 1-D float array.
+
+    Non-finite values are dropped. That is safe here because every
+    caller of this helper computes an order-independent statistic — a
+    moment or a tail quantile — where removing a hole does not move the
+    answer. Order-dependent statistics must use
+    :func:`_as_ordered_array` instead.
+    """
     values = np.asarray(returns, dtype="float64").ravel()
     values = values[np.isfinite(values)]
     if values.size == 0:
         raise ValueError("Return series is empty after dropping non-finite values.")
+    return values
+
+
+def _as_ordered_array(returns: pd.Series | np.ndarray) -> np.ndarray:
+    """Coerce to a 1-D float array, refusing to close gaps silently.
+
+    Autocorrelation and the Ljung-Box statistic read adjacency: they ask
+    what happened on the day *after* each day. Dropping a NaN run
+    silently splices its two sides together and makes them lag-1
+    neighbours, which moves the answer — punching a 100-day hole in a
+    2000-point series shifts ACF(1) and the Ljung-Box p-value by
+    percentage points. The array carries no calendar, so a gap cannot be
+    detected after the fact; it has to be refused at the door.
+
+    Observations are treated as consecutive. Weekend and holiday gaps in
+    a daily series are expected and are not flagged — this rejects
+    missing *values*, not missing calendar days, so resample or
+    interpolate deliberately before calling.
+    """
+    values = np.asarray(returns, dtype="float64").ravel()
+    if values.size == 0:
+        raise ValueError("Return series is empty.")
+    n_missing = int((~np.isfinite(values)).sum())
+    if n_missing:
+        raise ValueError(
+            f"Return series contains {n_missing} non-finite value(s). "
+            "Autocorrelation statistics depend on adjacency, so the gaps "
+            "cannot be dropped silently — handle them explicitly first."
+        )
     return values
 
 
@@ -71,6 +124,11 @@ def moments(returns: pd.Series) -> dict:
     definition (3 for a Gaussian).
     """
     values = _as_array(returns)
+    if values.size < MIN_OBS_MOMENTS:
+        raise ValueError(
+            f"Need at least {MIN_OBS_MOMENTS} observations for every moment to "
+            f"exist, got {values.size}."
+        )
     std = float(np.std(values, ddof=1))
     excess_kurtosis = float(stats.kurtosis(values, fisher=True, bias=False))
 
@@ -80,19 +138,44 @@ def moments(returns: pd.Series) -> dict:
         "skew": float(stats.skew(values, bias=False)),
         "kurtosis": excess_kurtosis + 3.0,
         "excess_kurtosis": excess_kurtosis,
-        "annualised_vol": std * np.sqrt(TRADING_DAYS),
+        "annualised_vol": float(std * np.sqrt(TRADING_DAYS)),
         "n_obs": int(values.size),
     }
 
 
+def _check_lags(n_obs: int, lags: int, name: str) -> None:
+    """Reject a lag count the sample cannot support.
+
+    statsmodels truncates silently, handing back a shorter array than
+    asked for; a caller indexing the lag it wanted then reads the wrong
+    one or raises IndexError far from the cause.
+    """
+    if lags < 1:
+        raise ValueError(f"{name} must be >= 1, got {lags}.")
+    if lags >= n_obs:
+        raise ValueError(
+            f"{name}={lags} needs more than {lags} observations, got {n_obs}."
+        )
+
+
 def acf_returns(returns: pd.Series, nlags: int = 40) -> np.ndarray:
-    """ACF of r_t. Expected ~0 at all lags."""
-    return acf(_as_array(returns), nlags=nlags, fft=True)
+    """ACF of r_t. Expected ~0 at all lags.
+
+    Returns ``nlags + 1`` values, lag 0 first.
+    """
+    values = _as_ordered_array(returns)
+    _check_lags(values.size, nlags, "nlags")
+    return acf(values, nlags=nlags, fft=True)
 
 
 def acf_squared(returns: pd.Series, nlags: int = 40) -> np.ndarray:
-    """ACF of r_t^2. Expected positive, slow decay (clustering)."""
-    return acf(_as_array(returns) ** 2, nlags=nlags, fft=True)
+    """ACF of r_t^2. Expected positive, slow decay (clustering).
+
+    Returns ``nlags + 1`` values, lag 0 first.
+    """
+    values = _as_ordered_array(returns)
+    _check_lags(values.size, nlags, "nlags")
+    return acf(values**2, nlags=nlags, fft=True)
 
 
 def ljung_box_squared(returns: pd.Series, lags: int = 10) -> float:
@@ -101,7 +184,9 @@ def ljung_box_squared(returns: pd.Series, lags: int = 10) -> float:
     A small p-value rejects "no autocorrelation in squared returns",
     i.e. it is evidence of volatility clustering.
     """
-    squared = _as_array(returns) ** 2
+    values = _as_ordered_array(returns)
+    _check_lags(values.size, lags, "lags")
+    squared = values**2
     result = acorr_ljungbox(squared, lags=[lags], return_df=True)
     return float(result["lb_pvalue"].iloc[0])
 
@@ -122,7 +207,6 @@ def hill_estimator(returns: pd.Series, tail: str = "left") -> dict:
     the bulk. Reading the plateau in between is the point of the plot.
     """
     losses = _tail_losses(returns, tail)
-    losses = losses[losses > 0.0]
     ordered = np.sort(losses)[::-1]
     n = ordered.size
 
@@ -143,8 +227,14 @@ def hill_estimator(returns: pd.Series, tail: str = "left") -> dict:
     threshold_logs = log_ordered[k_values]  # the (k+1)-th, zero-indexed
     mean_log_excess = top_k_sum / k_values - threshold_logs
 
+    # Guard against dividing by numerical noise, not just by exact zero:
+    # on near-constant losses the mean log excess lands just above zero
+    # and a bare `> 0` test lets alpha ~ 1e15 through as if it meant
+    # something. See MIN_MEAN_LOG_EXCESS.
     with np.errstate(divide="ignore", invalid="ignore"):
-        alpha = np.where(mean_log_excess > 0.0, 1.0 / mean_log_excess, np.nan)
+        alpha = np.where(
+            mean_log_excess > MIN_MEAN_LOG_EXCESS, 1.0 / mean_log_excess, np.nan
+        )
 
     return {"k": k_values, "alpha": alpha}
 
@@ -156,13 +246,29 @@ def pot_gpd_fit(
 ) -> dict:
     """Peaks-over-threshold GPD fit on exceedances.
 
-    Returns {'threshold','xi','beta','n_exceedances','tail_index'}.
-    ``tail_index`` is 1/xi when xi > 0, else NaN — a non-positive shape
-    means no power-law tail, so the tail index is undefined.
+    Returns {'threshold','xi','xi_se','beta','n_exceedances','tail_index'}.
+
+    ``threshold_quantile`` is a quantile **of the tail sub-sample**, not
+    of the return distribution: with ``tail='left'`` the 0.95 default is
+    the 95th percentile of the losses only, i.e. of the roughly half of
+    all days that were down. On real Brent that lands at u = 0.0519,
+    which is the 97.6th percentile of *all* returns — a 2.4% tail
+    probability, not 5%, and about 114 exceedances rather than the ~240 a
+    reader assuming "top 5% of returns" would expect. Quantiling the
+    thing actually being fitted is the defensible choice, but it is not
+    the reading the parameter name invites.
 
     The generalised Pareto is fitted to the exceedances over the
-    threshold with the location pinned at zero, which is the standard
-    POT parameterisation.
+    threshold with the location pinned at zero, the standard POT
+    parameterisation.
+
+    ``tail_index`` is 1/xi, but only when xi is distinguishable from
+    zero: a light tail whose shape noises just above zero would otherwise
+    yield a confident-looking absurdity (an exponential sample fitting
+    xi = +0.008 reports a tail index of 122). The test is one-sided at
+    95% against the asymptotic standard error
+    ``xi_se = (1 + xi) / sqrt(n_exceedances)``; anything short of that
+    returns NaN, since the data cannot support a power-law claim.
     """
     if not 0.0 < threshold_quantile < 1.0:
         raise ValueError(
@@ -181,13 +287,21 @@ def pot_gpd_fit(
 
     xi, _, beta = stats.genpareto.fit(exceedances, floc=0.0)
     xi = float(xi)
+    n_exceedances = int(exceedances.size)
+
+    # Asymptotic standard error of the GPD shape (Smith 1987), valid for
+    # xi > -0.5. Used to gate the tail index on significance rather than
+    # on sign alone.
+    xi_se = float((1.0 + xi) / np.sqrt(n_exceedances))
+    significant = xi > XI_SIGNIFICANCE_Z * xi_se
 
     return {
         "threshold": threshold,
         "xi": xi,
+        "xi_se": xi_se,
         "beta": float(beta),
-        "n_exceedances": int(exceedances.size),
-        "tail_index": 1.0 / xi if xi > 0.0 else float("nan"),
+        "n_exceedances": n_exceedances,
+        "tail_index": 1.0 / xi if significant else float("nan"),
     }
 
 
@@ -200,21 +314,39 @@ def mean_excess(returns: pd.Series, tail: str = "left") -> dict:
     A mean-excess function that rises roughly linearly in u is the
     signature of a heavy (generalised Pareto) tail; a flat one points to
     an exponential tail.
+
+    Exceedances are selected by **value**, not by position. On a sorted
+    sample, taking everything after index i quietly includes any
+    observations tied with u, which contribute a zero excess and drag
+    the mean down: on [1, 2, 2, 2, 5] that yields [1.75, 1.0, 1.5, 3.0]
+    where the definition gives [1.75, 3, 3, 3]. Ties are rare in returns
+    but not absent — real Brent has a handful — and this is the plot the
+    POT threshold gets read off.
+
+    Thresholds equal to the sample maximum are omitted: nothing exceeds
+    them, so the conditional mean is undefined there.
     """
     losses = np.sort(_tail_losses(returns, tail))
     n = losses.size
+    maximum = losses[-1]
 
-    # Every point but the last can serve as a threshold; the largest
-    # observation has no exceedances above it.
-    thresholds = losses[:-1]
-    reverse_sum = np.cumsum(losses[::-1])[::-1]
-    counts = np.arange(n, 0, -1)
+    thresholds = losses[losses < maximum]
+    if thresholds.size == 0:
+        raise ValueError(
+            f"All {n} {tail}-tail observations are identical; the mean-excess "
+            "function is undefined."
+        )
 
-    # Exceedances above thresholds[i] are losses[i+1:], so shift by one.
-    excess_sum = reverse_sum[1:] - thresholds * counts[1:]
-    mean_excess_values = excess_sum / counts[1:]
+    # suffix_sum[k] is the sum of losses[k:], with a trailing zero so the
+    # empty suffix is addressable.
+    suffix_sum = np.concatenate([np.cumsum(losses[::-1])[::-1], [0.0]])
 
-    return {"thresholds": thresholds, "mean_excess": mean_excess_values}
+    # First index holding a value strictly greater than each threshold.
+    first_above = np.searchsorted(losses, thresholds, side="right")
+    counts = n - first_above  # > 0, since every threshold is below the max
+    excess_sum = suffix_sum[first_above] - thresholds * counts
+
+    return {"thresholds": thresholds, "mean_excess": excess_sum / counts}
 
 
 def run_all(returns: pd.Series) -> dict:
