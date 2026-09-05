@@ -9,11 +9,17 @@ keeps the bootstrap fast and the results deterministic.
 import numpy as np
 import pandas as pd
 import pytest
+from scipy import stats as sps
+from statsmodels.tsa.stattools import acf
 
 from brent_synth.model import ModelFit, _leverage_weight, simulate
 from brent_synth.validation import (
+    DISPERSION_BOUNDS,
+    DUPLICATE_STATS,
+    INDEPENDENT_STATS,
     STAT_NAMES,
     bootstrap_bands,
+    compute_path_stats,
     compute_stats,
     make_report,
     run_validation,
@@ -288,3 +294,200 @@ def test_run_validation_end_to_end(tmp_path) -> None:
     assert path == str(out)
     assert out.stat().st_size > 20_000
     assert "data:image/png;base64," in out.read_text(encoding="utf-8")
+
+
+# --- regression: the two sides must compute the same statistic ------------
+
+
+def test_compute_stats_is_per_path_not_pooled() -> None:
+    """Pooling across paths at different vol levels is not the statistic.
+
+    Two groups of Gaussian paths, one ten times as volatile as the
+    other. Every individual path is Gaussian, so the per-path excess
+    kurtosis is ~0; the pooled mixture is strongly leptokurtic. The old
+    code returned the mixture value and compared it against a band built
+    from single 252-day samples.
+    """
+    rng = np.random.default_rng(0)
+    quiet = rng.normal(0.0, 0.005, (250, HORIZON))
+    loud = rng.normal(0.0, 0.050, (250, HORIZON))
+    paths = np.vstack([quiet, loud])
+
+    pooled = float(sps.kurtosis(paths.ravel(), fisher=True, bias=False))
+    reported = compute_stats(paths)["excess_kurtosis"]
+
+    assert pooled > 2.0  # the mixture looks fat-tailed
+    assert abs(reported) < 0.5  # each path does not
+    assert reported == pytest.approx(
+        float(np.median(compute_path_stats(paths)["excess_kurtosis"]))
+    )
+
+
+def test_acf_is_not_computed_across_path_boundaries() -> None:
+    """Splicing paths manufactures adjacencies that never happened.
+
+    Alternating quiet and loud iid paths have no within-path structure,
+    so every per-path ACF is ~0. Concatenating them makes the level
+    changes look like autocorrelation in squared returns.
+    """
+    rng = np.random.default_rng(1)
+    paths = np.vstack(
+        [
+            rng.normal(0.0, 0.005 if i % 2 else 0.05, HORIZON)
+            for i in range(200)
+        ]
+    )
+    spliced = acf(paths.ravel() ** 2, nlags=1, fft=True)[1]
+    per_path = compute_stats(paths)["acf_sq_lag1"]
+
+    assert spliced > per_path
+    assert abs(per_path) < 0.1
+
+
+def test_one_path_gives_the_same_answer_either_shape(market: pd.Series) -> None:
+    """A 1-D sample and a 1-row array are the same thing."""
+    sample = market.to_numpy()[:HORIZON]
+    flat = compute_stats(sample)
+    shaped = compute_stats(sample[None, :])
+    for name in STAT_NAMES:
+        assert flat[name] == pytest.approx(shaped[name]), name
+
+
+def test_bootstrap_and_synthetic_sides_share_one_code_path(
+    market: pd.Series,
+) -> None:
+    """Feeding bootstrap-shaped input through both entry points agrees."""
+    values = market.to_numpy()
+    blocks = values[: 4 * HORIZON].reshape(4, HORIZON)
+    per_path = compute_path_stats(blocks)
+    for name in STAT_NAMES:
+        assert per_path[name].shape == (4,)
+        singles = [compute_stats(blocks[i])[name] for i in range(4)]
+        assert np.allclose(per_path[name], singles), name
+
+
+# --- duplicates ------------------------------------------------------------
+
+
+def test_var_rows_are_aliases_of_the_tail_quantiles(synth: np.ndarray) -> None:
+    """var_95 and var_99 are sign flips, not independent checks."""
+    stats_ = compute_stats(synth)
+    assert stats_["var_95"] == -stats_["left_q05"]
+    assert stats_["var_99"] == -stats_["left_q01"]
+    assert set(DUPLICATE_STATS) == {"var_95", "var_99"}
+    assert len(INDEPENDENT_STATS) == len(STAT_NAMES) - 2
+
+
+def test_duplicates_are_excluded_from_the_headline(
+    synth: np.ndarray, market: pd.Series, bands: dict
+) -> None:
+    results = validate(synth, market, bands=bands)
+    assert (~results["independent"]).sum() == 2
+    for duplicate, original in DUPLICATE_STATS.items():
+        row = results.set_index("statistic")
+        assert row.loc[duplicate, "passed"] == row.loc[original, "passed"]
+
+
+# --- dispersion ------------------------------------------------------------
+
+
+def test_dispersion_catches_over_variable_paths(
+    market: pd.Series, bands: dict
+) -> None:
+    """A model can sit on the median and still be far too variable."""
+    rng = np.random.default_rng(3)
+    target = float(market.std())
+
+    # Vol drawn per path from a wide spread: right median, wrong spread.
+    wide_sigma = target * np.exp(rng.normal(0.0, 0.7, (400, 1)))
+    wide = rng.normal(0.0, 1.0, (400, HORIZON)) * wide_sigma
+    row = validate(wide, market, bands=bands).set_index("statistic").loc["std"]
+    assert row["dispersion_ratio"] > DISPERSION_BOUNDS[1]
+    assert not row["dispersion_passed"]
+
+    # Matched spread passes.
+    tight_sigma = target * np.exp(rng.normal(0.0, 0.18, (400, 1)))
+    tight = rng.normal(0.0, 1.0, (400, HORIZON)) * tight_sigma
+    tight_row = (
+        validate(tight, market, bands=bands).set_index("statistic").loc["std"]
+    )
+    assert tight_row["dispersion_passed"]
+
+
+def test_synthetic_spread_columns_bracket_the_median(
+    synth: np.ndarray, market: pd.Series, bands: dict
+) -> None:
+    results = validate(synth, market, bands=bands)
+    assert (results["synth_lo"] <= results["synthetic"]).all()
+    assert (results["synthetic"] <= results["synth_hi"]).all()
+
+
+# --- reuse, gaps, seeds ----------------------------------------------------
+
+
+def test_precomputed_bands_give_identical_results(
+    synth: np.ndarray, market: pd.Series
+) -> None:
+    """run_validation reuses its bootstrap; that must change nothing."""
+    computed = validate(synth, market, **BOOT_KWARGS)
+    bands = bootstrap_bands(market, horizon=HORIZON, **BOOT_KWARGS)
+    reused = validate(synth, market, bands=bands)
+    pd.testing.assert_frame_equal(computed, reused)
+
+
+def test_bootstrap_options_with_bands_are_rejected(
+    synth: np.ndarray, market: pd.Series, bands: dict
+) -> None:
+    with pytest.raises(ValueError, match="ignored when `bands`"):
+        validate(synth, market, bands=bands, n_boot=99)
+
+
+def test_bootstrap_refuses_to_splice_gaps(market: pd.Series) -> None:
+    """A block bootstrap exists to preserve adjacency."""
+    gapped = market.copy()
+    gapped.iloc[[10, 50, 100, 200, 300]] = np.nan
+    with pytest.raises(ValueError, match="non-finite"):
+        bootstrap_bands(gapped, horizon=HORIZON, **BOOT_KWARGS)
+
+
+def test_report_honours_the_bootstrap_seed(
+    market: pd.Series, synth: np.ndarray, bands: dict, tmp_path
+) -> None:
+    """The drawdown plot must use the caller's seed, not a hardcoded 7."""
+    results = validate(synth, market, bands=bands)
+    payloads = []
+    for boot_seed in (7, 99):
+        out = tmp_path / f"seed_{boot_seed}.html"
+        make_report(
+            market,
+            _known_fit(),
+            synth,
+            results,
+            out_path=str(out),
+            seed=42,
+            n_boot=N_BOOT,
+            boot_seed=boot_seed,
+        )
+        payloads.append(out.read_bytes())
+    assert payloads[0] != payloads[1]
+
+
+def test_report_labels_persistence_with_the_current_formula(
+    market: pd.Series, synth: np.ndarray, bands: dict, tmp_path
+) -> None:
+    results = validate(synth, market, bands=bands)
+    out = tmp_path / "labels.html"
+    make_report(
+        market,
+        _known_fit(),
+        synth,
+        results,
+        out_path=str(out),
+        seed=42,
+        n_boot=N_BOOT,
+        boot_drawdowns=bands["max_drawdown"][3],
+    )
+    text = out.read_text(encoding="utf-8")
+    assert "γ/2" not in text
+    assert "leverage weight" in text
+    assert "Spread" in text  # dispersion column is surfaced

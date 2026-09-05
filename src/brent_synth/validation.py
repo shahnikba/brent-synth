@@ -14,6 +14,30 @@ band. Comparing a 252-day synthetic path against statistics measured
 over the full 4754-day history would be a category error: the band
 would be far too tight and everything would fail.
 
+The mirror of that error is just as easy to commit, and this module
+used to commit it. Pooling every synthetic day into one 1,260,000-point
+sample and comparing *that* against a band built from 252-day samples
+is not a like-for-like comparison either: for anything nonlinear in the
+sample the two are different quantities. Pooling mixes paths whose
+realised volatility spans 37x, and a mixture across vol levels is far
+more leptokurtic than any single path — pooled excess kurtosis read
+99.6 where the per-path median was 2.0, and between-path level
+differences inflated the ACF of squared returns roughly fourfold, on
+top of splicing n_paths - 1 false lag-1 adjacencies at the joins.
+
+So **every statistic is computed per path, on exactly `horizon`
+observations, on both sides**. The synthetic side is a distribution
+over paths; the real side is a distribution over bootstrap samples.
+That symmetry is the whole design, and it is what
+:func:`compute_path_stats` enforces.
+
+Location and dispersion are reported separately. A pooled point
+estimate had no sampling noise, so the test could only ever ask whether
+the model's central value landed in the band — it had no power to
+detect wrong spread. Comparing the two distributions catches that:
+Brent's synthetic paths sit correctly on the median but over-disperse
+volatility, which only the dispersion column shows.
+
 Sign conventions
 ----------------
 Returns stay signed throughout. VaR and ES are reported as **positive
@@ -82,6 +106,24 @@ STAT_NAMES = (
     "max_drawdown",
 )
 
+#: var_95 and var_99 are the left tail quantiles with the sign flipped:
+#: var_95 == -left_q05 and var_99 == -left_q01, bit-for-bit, by
+#: construction. Both names are reported because both are conventional,
+#: but they are one check each, not two, and the headline pass count
+#: must not double-count tail agreement.
+DUPLICATE_STATS = {"var_95": "left_q05", "var_99": "left_q01"}
+
+#: The statistics that are independent checks of each other.
+INDEPENDENT_STATS = tuple(n for n in STAT_NAMES if n not in DUPLICATE_STATS)
+
+#: Acceptable ratio of synthetic to real inter-quantile width. A model
+#: can sit perfectly on the median and still generate paths half or
+#: twice as variable as the market; this is the check for that. The
+#: bounds are deliberately loose - both sides are themselves estimated
+#: from finite samples - so a flag here means a gross mismatch of
+#: spread, not a marginal one.
+DISPERSION_BOUNDS = (0.5, 2.0)
+
 STAT_LABELS = {
     "mean": "Mean daily return",
     "std": "Daily volatility",
@@ -139,39 +181,86 @@ def _max_drawdown(paths: np.ndarray) -> np.ndarray:
     return drawdown.max(axis=1)
 
 
-def compute_stats(paths_or_sample: np.ndarray | pd.Series) -> dict[str, float]:
-    """Works on a (n, horizon) synthetic array OR a 1-D bootstrap sample.
+def _acf_at_lags(paths: np.ndarray, lags: tuple[int, ...]) -> dict[int, np.ndarray]:
+    """ACF of each row at the given lags, vectorised across rows.
 
-    Pooled statistics (moments, VaR, ES, tail quantiles, ACF of squared
-    returns) are taken over all days at once. ``max_drawdown`` is a path
-    functional: it is computed per path and reduced by the median, so a
-    1-D sample yields that sample's own drawdown.
+    The same biased estimator statsmodels uses by default: the
+    numerator sums over the overlapping span, the denominator over the
+    whole series. Computed row-wise rather than on a concatenation,
+    which is the point — splicing rows together would manufacture
+    adjacencies that do not exist.
+    """
+    centred = paths - paths.mean(axis=1, keepdims=True)
+    denominator = (centred**2).sum(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return {
+            lag: np.where(
+                denominator > 0.0,
+                (centred[:, lag:] * centred[:, :-lag]).sum(axis=1) / denominator,
+                0.0,
+            )
+            for lag in lags
+        }
+
+
+def _mean_beyond(paths: np.ndarray, cutoff: np.ndarray) -> np.ndarray:
+    """Row-wise mean of the values at or below each row's cutoff."""
+    mask = paths <= cutoff[:, None]
+    counts = mask.sum(axis=1)
+    totals = np.where(mask, paths, 0.0).sum(axis=1)
+    return np.where(counts > 0, totals / np.maximum(counts, 1), cutoff)
+
+
+def compute_path_stats(paths_or_sample) -> dict[str, np.ndarray]:
+    """Every statistic, computed **per path**, as arrays of length n_paths.
+
+    This is the primitive both sides of the comparison run through: the
+    synthetic paths and the bootstrap samples are both (n, horizon)
+    arrays of the same horizon, and neither is ever pooled. A 1-D input
+    is one path and yields length-1 arrays.
     """
     paths = _as_paths(paths_or_sample)
-    pooled = paths.ravel()
 
-    q01, q05, q95, q99 = np.quantile(pooled, [0.01, 0.05, 0.95, 0.99])
-    acf_sq = acf(pooled**2, nlags=10, fft=True)
+    quantiles = np.quantile(paths, [0.01, 0.05, 0.95, 0.99], axis=1)
+    q01, q05, q95, q99 = quantiles
+    acf_squared = _acf_at_lags(paths**2, (1, 5, 10))
 
     return {
-        "mean": float(np.mean(pooled)),
-        "std": float(np.std(pooled, ddof=1)),
-        "skew": float(sps.skew(pooled, bias=False)),
-        "excess_kurtosis": float(sps.kurtosis(pooled, fisher=True, bias=False)),
+        "mean": paths.mean(axis=1),
+        "std": paths.std(axis=1, ddof=1),
+        "skew": sps.skew(paths, axis=1, bias=False),
+        "excess_kurtosis": sps.kurtosis(paths, axis=1, fisher=True, bias=False),
         # VaR/ES flipped to positive loss magnitudes.
-        "var_95": float(-q05),
-        "var_99": float(-q01),
-        "es_95": float(-np.mean(pooled[pooled <= q05])),
-        "es_99": float(-np.mean(pooled[pooled <= q01])),
+        "var_95": -q05,
+        "var_99": -q01,
+        "es_95": -_mean_beyond(paths, q05),
+        "es_99": -_mean_beyond(paths, q01),
         # Raw signed quantiles, left ones negative.
-        "left_q01": float(q01),
-        "left_q05": float(q05),
-        "right_q95": float(q95),
-        "right_q99": float(q99),
-        "acf_sq_lag1": float(acf_sq[1]),
-        "acf_sq_lag5": float(acf_sq[5]),
-        "acf_sq_lag10": float(acf_sq[10]),
-        "max_drawdown": float(np.median(_max_drawdown(paths))),
+        "left_q01": q01,
+        "left_q05": q05,
+        "right_q95": q95,
+        "right_q99": q99,
+        "acf_sq_lag1": acf_squared[1],
+        "acf_sq_lag5": acf_squared[5],
+        "acf_sq_lag10": acf_squared[10],
+        "max_drawdown": _max_drawdown(paths),
+    }
+
+
+def compute_stats(paths_or_sample) -> dict[str, float]:
+    """Works on a (n, horizon) synthetic array OR a 1-D bootstrap sample.
+
+    Returns the **median across paths** of each per-path statistic — the
+    typical path, on the same footing as a single bootstrap sample. On a
+    1-D input the median of one value is that value, so the two sides of
+    the comparison genuinely share one code path and cannot drift apart.
+
+    Nothing here pools days across paths. See the module docstring for
+    why that mattered.
+    """
+    return {
+        name: float(np.median(values))
+        for name, values in compute_path_stats(paths_or_sample).items()
     }
 
 
@@ -214,7 +303,16 @@ def bootstrap_bands(
     ``{stat_name: (lo2.5, median, hi97.5, full_array)}``.
     """
     values = np.asarray(returns, dtype="float64").ravel()
-    values = values[np.isfinite(values)]
+    n_missing = int((~np.isfinite(values)).sum())
+    if n_missing:
+        # A block bootstrap exists to preserve adjacency; dropping a gap
+        # closes it and glues non-neighbours together in every resample
+        # that spans the hole. Refused here as in diagnostics and model.
+        raise ValueError(
+            f"Return series contains {n_missing} non-finite value(s). "
+            "The block bootstrap resamples runs of adjacent days, so the "
+            "gaps cannot be dropped silently — handle them explicitly first."
+        )
     if values.size < horizon:
         raise ValueError(
             f"Need at least {horizon} returns to bootstrap at that horizon, "
@@ -227,13 +325,10 @@ def bootstrap_bands(
     indices = _stationary_bootstrap_indices(
         values.size, horizon, n_boot, block, rng
     )
-    samples = values[indices]
-
-    drawn = {name: np.empty(n_boot) for name in STAT_NAMES}
-    for i in range(n_boot):
-        sample_stats = compute_stats(samples[i])
-        for name in STAT_NAMES:
-            drawn[name][i] = sample_stats[name]
+    # Every replicate is a row of one (n_boot, horizon) array, so the
+    # whole bootstrap distribution comes from a single vectorised pass
+    # rather than n_boot separate calls.
+    drawn = compute_path_stats(values[indices])
 
     return {
         name: (
@@ -247,18 +342,29 @@ def bootstrap_bands(
 
 
 def validate(
-    synth_paths: np.ndarray, returns: pd.Series, **kwargs: Any
+    synth_paths: np.ndarray,
+    returns: pd.Series,
+    bands: dict[str, tuple[float, float, float, np.ndarray]] | None = None,
+    **kwargs: Any,
 ) -> pd.DataFrame:
     """For each statistic: synthetic value, real bootstrap (lo, median,
     hi), PASS if synthetic in [lo, hi] else FAIL, and the z-like
     position (how many band-widths outside).
 
+    ``synthetic`` is the median across synthetic paths, each measured on
+    ``horizon`` days — the same footing as one bootstrap replicate.
+    ``synth_lo``/``synth_hi`` give the 2.5-97.5% spread across paths, and
+    ``dispersion_ratio`` compares that width to the real band's.
+    A model can sit dead on the median and still be far too variable,
+    which ``passed`` alone cannot see; ``dispersion_passed`` can.
+
     ``position`` is 0 inside the band, negative below it and positive
     above, measured in band widths — so -0.5 means the synthetic value
     sits half a band below the 2.5% bound.
 
-    Both sides are computed at the same horizon; a mismatch raises,
-    since it would silently invalidate every comparison.
+    Pass ``bands`` to reuse an already-computed bootstrap; otherwise one
+    is run here. Both sides are computed at the same horizon; a mismatch
+    raises, since it would silently invalidate every comparison.
     """
     paths = _as_paths(synth_paths)
     horizon = kwargs.pop("horizon", paths.shape[1])
@@ -268,13 +374,23 @@ def validate(
             f"horizon {horizon}; both sides must use the same horizon."
         )
 
-    bands = bootstrap_bands(returns, horizon=horizon, **kwargs)
-    synthetic = compute_stats(paths)
+    if bands is None:
+        bands = bootstrap_bands(returns, horizon=horizon, **kwargs)
+    elif kwargs:
+        raise ValueError(
+            f"Bootstrap options {sorted(kwargs)} are ignored when `bands` is "
+            "supplied; pass them to bootstrap_bands instead."
+        )
+
+    per_path = compute_path_stats(paths)
 
     rows = []
     for name in STAT_NAMES:
         lo, median, hi, _ = bands[name]
-        value = synthetic[name]
+        draws = per_path[name]
+        value = float(np.median(draws))
+        synth_lo, synth_hi = (float(x) for x in np.quantile(draws, [0.025, 0.975]))
+
         width = hi - lo
         if lo <= value <= hi:
             position = 0.0
@@ -282,16 +398,30 @@ def validate(
             position = (value - lo) / width if value < lo else (value - hi) / width
         else:
             position = float("nan")
+
+        if width > 0.0:
+            ratio = (synth_hi - synth_lo) / width
+            low, high = DISPERSION_BOUNDS
+            dispersion_passed = bool(low <= ratio <= high)
+        else:
+            ratio = float("nan")
+            dispersion_passed = False
+
         rows.append(
             {
                 "statistic": name,
                 "label": STAT_LABELS[name],
                 "synthetic": value,
+                "synth_lo": synth_lo,
+                "synth_hi": synth_hi,
                 "boot_lo": lo,
                 "boot_median": median,
                 "boot_hi": hi,
                 "passed": bool(lo <= value <= hi),
                 "position": position,
+                "dispersion_ratio": ratio,
+                "dispersion_passed": dispersion_passed,
+                "independent": name not in DUPLICATE_STATS,
             }
         )
 
@@ -428,20 +558,32 @@ def _plot_drawdown(boot_drawdowns: np.ndarray, paths: np.ndarray) -> str:
 
 def _results_table_html(results: pd.DataFrame) -> str:
     header = (
-        "<tr><th>Statistic</th><th>Synthetic</th><th>Real 2.5%</th>"
-        "<th>Real median</th><th>Real 97.5%</th><th>Position</th><th>Result</th></tr>"
+        "<tr><th>Statistic</th><th>Synthetic median</th><th>Synthetic 2.5-97.5%</th>"
+        "<th>Real 2.5%</th><th>Real median</th><th>Real 97.5%</th>"
+        "<th>Position</th><th>Spread</th><th>Result</th></tr>"
     )
     rows = []
     for row in results.itertuples():
         verdict = "PASS" if row.passed else "FAIL"
+        spread = "n/a" if not np.isfinite(row.dispersion_ratio) else (
+            f"{row.dispersion_ratio:.2f}x"
+        )
+        spread_class = "ok" if row.dispersion_passed else "wide"
+        label = html.escape(row.label)
+        if not row.independent:
+            label += " <span class='alias'>= -%s</span>" % html.escape(
+                STAT_LABELS[DUPLICATE_STATS[row.statistic]]
+            )
         rows.append(
             f'<tr class="{verdict.lower()}">'
-            f"<td class='stat'>{html.escape(row.label)}</td>"
+            f"<td class='stat'>{label}</td>"
             f"<td>{row.synthetic:.5f}</td>"
+            f"<td>{row.synth_lo:.5f} to {row.synth_hi:.5f}</td>"
             f"<td>{row.boot_lo:.5f}</td>"
             f"<td>{row.boot_median:.5f}</td>"
             f"<td>{row.boot_hi:.5f}</td>"
             f"<td>{row.position:+.2f}</td>"
+            f"<td class='{spread_class}'>{spread}</td>"
             f"<td class='verdict'>{verdict}</td></tr>"
         )
     return f"<table class='results'>{header}{''.join(rows)}</table>"
@@ -456,6 +598,7 @@ def make_report(
     seed: int | None = None,
     block: int = DEFAULT_BLOCK,
     n_boot: int = DEFAULT_N_BOOT,
+    boot_seed: int = 7,
     boot_drawdowns: np.ndarray | None = None,
 ) -> str:
     """Self-contained HTML. Embeds plots as base64 PNGs. Returns the path.
@@ -471,7 +614,11 @@ def make_report(
 
     if boot_drawdowns is None:
         bands = bootstrap_bands(
-            returns, horizon=paths.shape[1], n_boot=n_boot, block=block, seed=7
+            returns,
+            horizon=paths.shape[1],
+            n_boot=n_boot,
+            block=block,
+            seed=boot_seed,
         )
         boot_drawdowns = bands["max_drawdown"][3]
 
@@ -483,13 +630,25 @@ def make_report(
         ("Drawdown distribution", _plot_drawdown(boot_drawdowns, paths)),
     ]
 
-    n_pass = int(results_df["passed"].sum())
-    n_total = len(results_df)
-    failures = results_df.loc[~results_df["passed"]]
+    independent = results_df.loc[results_df["independent"]]
+    n_pass = int(independent["passed"].sum())
+    n_total = len(independent)
+    n_wide = int((~independent["dispersion_passed"]).sum())
+    failures = results_df.loc[~results_df["passed"] & results_df["independent"]]
+    wide = independent.loc[~independent["dispersion_passed"]]
 
     params_rows = "".join(
         f"<tr><td class='stat'>{html.escape(name)}</td><td>{value:.6g}</td></tr>"
         for name, value in fit.params.items()
+    )
+
+    wide_lines = "".join(
+        f"<li><b>{html.escape(row.label)}</b> — synthetic paths span "
+        f"{row.synth_lo:.5f} to {row.synth_hi:.5f}, "
+        f"{row.dispersion_ratio:.2f}x the real band "
+        f"[{row.boot_lo:.5f}, {row.boot_hi:.5f}]."
+        " <i>TODO: is this over- or under-dispersion the model's doing?</i></li>"
+        for row in wide.itertuples()
     )
 
     failure_lines = (
@@ -536,14 +695,20 @@ def make_report(
  img {{ max-width: 100%; border: 1px solid #e4e4e4; }}
  figcaption {{ font-size: 12.5px; color: #666; margin-top: .35rem; }}
  .summary {{ background: #f7f7f7; border-left: 3px solid #999; padding: .7rem 1rem; }}
+ .alias {{ color: #888; font-weight: 400; font-size: 11.5px; }}
+ td.wide {{ color: #a11414; font-weight: 600; }}
  .todo {{ background: #fffbe6; border-left: 3px solid #d9a400; padding: .7rem 1rem; }}
  code {{ background: #f2f2f2; padding: .1rem .3rem; }}
 </style></head><body>
 <h1>Brent synthetic-path validation</h1>
-<p class="summary"><b>{n_pass} of {n_total}</b> statistics fall inside the real
-bootstrap band. Synthetic paths come from GJR-GARCH(1,1,1) with skewed-t
-innovations; the acceptance band is a stationary block bootstrap of the real
-returns at the same horizon.</p>
+<p class="summary"><b>{n_pass} of {n_total}</b> independent statistics fall inside
+the real bootstrap band, and <b>{n_wide}</b> show a spread outside
+{DISPERSION_BOUNDS[0]:g}-{DISPERSION_BOUNDS[1]:g}x the real one. Synthetic paths come
+from GJR-GARCH(1,1,1) with skewed-t innovations; the acceptance band is a
+stationary block bootstrap of the real returns at the same horizon. Every
+statistic is measured per path on {paths.shape[1]} days, on both sides — VaR
+rows are the signed tail quantiles under another name and are excluded from
+the count above.</p>
 
 <h2>1. Run configuration</h2>
 <table>
@@ -554,17 +719,22 @@ returns at the same horizon.</p>
 <tr><td class="stat">Bootstrap block (expected days)</td><td>{block}</td></tr>
 <tr><td class="stat">Simulation seed</td><td>{html.escape(seed_text)}</td></tr>
 {params_rows}
-<tr><td class="stat">persistence (α + γ/2 + β)</td><td>{fit.persistence:.6f}</td></tr>
+<tr><td class="stat">persistence (α + γ·E[z²1{{z&lt;0}}] + β)</td><td>{fit.persistence:.6f}</td></tr>
+<tr><td class="stat">leverage weight E[z²1{{z&lt;0}}]</td><td>{fit.leverage_weight:.6f}</td></tr>
 <tr><td class="stat">forecast variance σ²(T+1)</td><td>{fit.forecast_variance:.6g}</td></tr>
 <tr><td class="stat">unconditional variance</td><td>{fit.unconditional_variance:.6g}</td></tr>
 </table>
 
 <h2>2. Acceptance table</h2>
-<p>A statistic PASSES when the synthetic value lies inside the real
+<p>A statistic PASSES when the synthetic median lies inside the real
 2.5–97.5% bootstrap band. <code>Position</code> is 0 inside the band, and
 otherwise counts band-widths beyond the breached bound (negative below,
-positive above). VaR and ES are positive loss magnitudes; the percentile
-rows are signed returns.</p>
+positive above). <code>Spread</code> is the synthetic 2.5–97.5% width over the
+real one: a model can sit on the median and still be far too variable, and
+only this column sees that. VaR and ES are positive loss magnitudes; the
+percentile rows are signed returns. Rows marked <span class="alias">= -…</span>
+are the same number as another row, reported under both conventional names and
+counted once.</p>
 {_results_table_html(results_df)}
 
 <h2>3. Plots</h2>
@@ -575,6 +745,8 @@ rows are signed returns.</p>
 <p><b>TODO — narrative to be written.</b> The numbers below are pre-filled;
 the interpretation is not.</p>
 <ul>{failure_lines}</ul>
+<p><b>Spread mismatches ({n_wide}):</b></p>
+<ul>{wide_lines or "<li>Every statistic's spread sits within the bounds.</li>"}</ul>
 <p><i>TODO: state whether the ACF decay mismatch is acceptable for the
 intended use, and whether the block length of {block} days is doing
 material work in the width of these bands.</i></p>
@@ -607,9 +779,9 @@ def run_validation(
     bands = bootstrap_bands(
         returns, horizon=horizon, n_boot=n_boot, block=block, seed=boot_seed
     )
-    results = validate(
-        paths, returns, n_boot=n_boot, block=block, seed=boot_seed
-    )
+    # Reuse the bootstrap just computed rather than running an identical
+    # one inside validate(); it is the dominant cost of this pipeline.
+    results = validate(paths, returns, bands=bands)
     return make_report(
         returns,
         fitted,
@@ -619,5 +791,6 @@ def run_validation(
         seed=seed,
         block=block,
         n_boot=n_boot,
+        boot_seed=boot_seed,
         boot_drawdowns=bands["max_drawdown"][3],
     )
