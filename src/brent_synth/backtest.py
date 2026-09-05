@@ -72,6 +72,14 @@ RANK_STATS = (
 #: The four per-origin losses the ranking rule uses, all lower-is-better.
 RANKING_LOSSES = ("mean_nll", "mean_tail_crps", "exc99_abs_error", "path_coverage_loss")
 
+#: How an origin where a candidate's fit raised is scored.
+#:
+#: "worst_rank" (Amendment 1) gives the failed candidate the worst rank
+#: on all four losses at that origin. "drop" is the original rule: the
+#: row is discarded and the survivors re-ranked among themselves.
+FAILURE_RULES = ("worst_rank", "drop")
+DEFAULT_FAILURE_RULE = "worst_rank"
+
 VAR_LEVELS = (0.95, 0.99)
 REGIME_LABELS = ("calm", "normal", "stress")
 PREREGISTRATION_PATH = Path("docs/preregistration.md")
@@ -236,6 +244,19 @@ origin (1 = best), then averaged with the stress weighting below.
 Champion = lowest weighted mean rank on the selection origins; ties
 broken by lower ladder step. The same table is then recomputed on the
 confirmation origins and reported verbatim, whether or not it agrees.
+
+## Amendment 1 (post-hoc)
+
+A candidate whose fit raises at an origin now receives the worst rank
+on all four losses at that origin, rather than being dropped and the
+survivors re-ranked among themselves.
+
+Reason: dropping the row scores a candidate only where it happened to
+work, which is survivorship bias — `gjr_skewt_vt` was being averaged
+over 3 of 8 selection origins while every other candidate was averaged
+over 8. Both rulings are reported side by side.
+
+Adopted after the first run, before any champion was acted on.
 """
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
     return body + f"\n## Hash\n\n`sha256:{digest}`\n"
@@ -501,29 +522,74 @@ def run_backtest(
 # --- ranking ---------------------------------------------------------------
 
 
-def rank_table(summary: pd.DataFrame, origin_years=None) -> pd.DataFrame:
-    """Rank each model against the others at each origin, per loss."""
+def rank_table(
+    summary: pd.DataFrame,
+    origin_years=None,
+    failure_rule: str = DEFAULT_FAILURE_RULE,
+) -> pd.DataFrame:
+    """Rank each model against the others at each origin, per loss.
+
+    ``failure_rule`` decides what happens at an origin where a
+    candidate's fit raised.
+
+    ``"worst_rank"`` (Amendment 1) assigns it the worst available rank on
+    all four losses. A generator that cannot produce scenarios has
+    failed at that origin, and that is information about the model, not
+    a missing observation.
+
+    ``"drop"`` is the original pre-registered rule: discard the row and
+    re-rank the survivors 1..n-1. It is kept so both rulings can be
+    reported side by side, but it is survivorship bias — a candidate is
+    scored only where it happened to work, and the survivors' ranks are
+    inflated at exactly the origins that were hard enough to break
+    something.
+    """
+    if failure_rule not in FAILURE_RULES:
+        raise ValueError(
+            f"failure_rule must be one of {FAILURE_RULES}, got {failure_rule!r}."
+        )
+
     frame = summary.copy()
     if origin_years is not None:
         frame = frame[frame["origin_year"].isin(origin_years)]
-    frame = frame[frame["status"] == "ok"]
     if frame.empty:
         return pd.DataFrame(columns=["model", "origin_year", *RANKING_LOSSES])
 
-    ranked = frame[["model", "step", "origin_year", "regime", *RANKING_LOSSES]].copy()
+    n_models = int(frame["model"].nunique())
+    succeeded = frame["status"] == "ok"
+
+    if failure_rule == "drop":
+        frame = frame[succeeded]
+        if frame.empty:
+            return pd.DataFrame(columns=["model", "origin_year", *RANKING_LOSSES])
+
+    ranked = frame[
+        ["model", "step", "origin_year", "regime", "status", *RANKING_LOSSES]
+    ].copy()
+    ok = ranked["status"] == "ok"
+
     for loss in RANKING_LOSSES:
-        ranked[f"rank_{loss}"] = ranked.groupby("origin_year")[loss].rank(
-            method="average"
+        column = f"rank_{loss}"
+        ranked[column] = np.nan
+        ranked.loc[ok, column] = (
+            ranked[ok].groupby("origin_year")[loss].rank(method="average")
         )
+        # A failure takes the worst rank rather than vanishing.
+        ranked.loc[~ok, column] = float(n_models)
+
     rank_columns = [f"rank_{loss}" for loss in RANKING_LOSSES]
     ranked["mean_rank"] = ranked[rank_columns].mean(axis=1)
     ranked["weight"] = np.where(ranked["regime"] == "stress", STRESS_WEIGHT, 1.0)
     return ranked
 
 
-def score_models(summary: pd.DataFrame, origin_years=None) -> pd.DataFrame:
+def score_models(
+    summary: pd.DataFrame,
+    origin_years=None,
+    failure_rule: str = DEFAULT_FAILURE_RULE,
+) -> pd.DataFrame:
     """Weighted mean rank per model, plus rank stability."""
-    ranked = rank_table(summary, origin_years)
+    ranked = rank_table(summary, origin_years, failure_rule)
     if ranked.empty:
         return pd.DataFrame()
 
@@ -543,6 +609,7 @@ def score_models(summary: pd.DataFrame, origin_years=None) -> pd.DataFrame:
                 ),
                 "rank_stability": float(group["in_top_two"].mean()),
                 "n_origins": int(len(group)),
+                "n_failed": int((group["status"] != "ok").sum()),
                 **{
                     f"mean_{loss}": float(group[loss].mean())
                     for loss in RANKING_LOSSES
@@ -553,9 +620,13 @@ def score_models(summary: pd.DataFrame, origin_years=None) -> pd.DataFrame:
     return scored.reset_index(drop=True)
 
 
-def select_champion(summary: pd.DataFrame, origin_years=SELECTION_YEARS) -> str:
+def select_champion(
+    summary: pd.DataFrame,
+    origin_years=SELECTION_YEARS,
+    failure_rule: str = DEFAULT_FAILURE_RULE,
+) -> str:
     """Lowest weighted score on the selection origins; ties to lower step."""
-    scored = score_models(summary, origin_years)
+    scored = score_models(summary, origin_years, failure_rule)
     if scored.empty:
         raise ValueError("No successful runs on the selection origins.")
     best = scored.iloc[0]
@@ -563,10 +634,13 @@ def select_champion(summary: pd.DataFrame, origin_years=SELECTION_YEARS) -> str:
 
 
 def confirm(
-    summary: pd.DataFrame, champion: str, origin_years=CONFIRMATION_YEARS
+    summary: pd.DataFrame,
+    champion: str,
+    origin_years=CONFIRMATION_YEARS,
+    failure_rule: str = DEFAULT_FAILURE_RULE,
 ) -> tuple[pd.DataFrame, bool]:
     """Recompute the table on held-out origins; report whether it agrees."""
-    scored = score_models(summary, origin_years)
+    scored = score_models(summary, origin_years, failure_rule)
     if scored.empty:
         return scored, False
     return scored, bool(scored.iloc[0]["model"] == champion)

@@ -50,6 +50,19 @@ Champion = lowest weighted mean rank on the selection origins; ties
 broken by lower ladder step. The same table is then recomputed on the
 confirmation origins and reported verbatim, whether or not it agrees.
 
+## Amendment 1 (post-hoc)
+
+A candidate whose fit raises at an origin now receives the worst rank
+on all four losses at that origin, rather than being dropped and the
+survivors re-ranked among themselves.
+
+Reason: dropping the row scores a candidate only where it happened to
+work, which is survivorship bias — `gjr_skewt_vt` was being averaged
+over 3 of 8 selection origins while every other candidate was averaged
+over 8. Both rulings are reported side by side.
+
+Adopted after the first run, before any champion was acted on.
+
 ## Hash
 
-`sha256:c2701bd8e122b5f56aa70752f595b2ffee98b843c5c6d317227f368f5c661c8c`
+`sha256:15aa66f01f4562b48f9aa807d4c697363b17d392c0e417d02b7f0c59baa20469`

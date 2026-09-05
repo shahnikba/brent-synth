@@ -23,6 +23,7 @@ from brent_synth.backtest import (
     path_coverage_loss,
     percentile_ranks,
     preregistration_hash,
+    rank_table,
     regime_labels,
     run_backtest,
     score_models,
@@ -290,7 +291,8 @@ def test_confirmation_reports_agreement_honestly() -> None:
     assert table.iloc[0]["model"] == "a"
 
 
-def test_failed_runs_are_excluded_from_ranking() -> None:
+def test_failed_runs_are_ranked_last_not_dropped() -> None:
+    """Under Amendment 1 a broken model still appears, ranked worst."""
     rows = [
         {
             "model": "good",
@@ -309,5 +311,83 @@ def test_failed_runs_are_excluded_from_ranking() -> None:
             **{loss: np.nan for loss in RANKING_LOSSES},
         },
     ]
-    scored = score_models(pd.DataFrame(rows), (2011,))
-    assert list(scored["model"]) == ["good"]
+    summary = pd.DataFrame(rows)
+
+    amended = score_models(summary, (2011,), failure_rule="worst_rank")
+    assert list(amended["model"]) == ["good", "broken"]
+    assert amended.set_index("model").loc["broken", "weighted_score"] == 2.0
+
+    # The original rule still exists, and still hides the failure entirely.
+    dropped = score_models(summary, (2011,), failure_rule="drop")
+    assert list(dropped["model"]) == ["good"]
+
+
+# --- Amendment 1: unavailable models take the worst rank -------------------
+
+
+def _mixed_summary() -> pd.DataFrame:
+    """Three models over two origins; one fails at the second origin."""
+    rows = []
+    for year in (2011, 2012):
+        for model, step, loss in (("best", 1, 0.1), ("mid", 2, 0.2), ("flaky", 3, 0.05)):
+            failed = model == "flaky" and year == 2012
+            rows.append(
+                {
+                    "model": model,
+                    "step": step,
+                    "origin_year": year,
+                    "regime": "normal",
+                    "status": "failed" if failed else "ok",
+                    **{
+                        name: (np.nan if failed else loss) for name in RANKING_LOSSES
+                    },
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_amendment_gives_failures_the_worst_rank() -> None:
+    """A model that cannot produce scenarios has failed, not abstained."""
+    summary = _mixed_summary()
+    ranked = rank_table(summary, (2011, 2012), failure_rule="worst_rank")
+
+    failed = ranked[(ranked["model"] == "flaky") & (ranked["origin_year"] == 2012)]
+    assert len(failed) == 1
+    n_models = summary["model"].nunique()
+    for loss in RANKING_LOSSES:
+        assert float(failed[f"rank_{loss}"].iloc[0]) == float(n_models)
+
+    # Every model is now scored on every origin.
+    scored = score_models(summary, (2011, 2012), failure_rule="worst_rank")
+    assert set(scored["n_origins"]) == {2}
+    assert int(scored.set_index("model").loc["flaky", "n_failed"]) == 1
+
+
+def test_original_rule_drops_failures_and_flatters_them() -> None:
+    """The bias the amendment removes, demonstrated."""
+    summary = _mixed_summary()
+    dropped = score_models(summary, (2011, 2012), failure_rule="drop")
+    amended = score_models(summary, (2011, 2012), failure_rule="worst_rank")
+
+    # 'flaky' wins on the one origin it survives, so dropping flatters it.
+    assert int(dropped.set_index("model").loc["flaky", "n_origins"]) == 1
+    assert int(amended.set_index("model").loc["flaky", "n_origins"]) == 2
+    assert (
+        amended.set_index("model").loc["flaky", "weighted_score"]
+        > dropped.set_index("model").loc["flaky", "weighted_score"]
+    )
+
+
+def test_failure_rule_is_validated() -> None:
+    with pytest.raises(ValueError, match="failure_rule must be"):
+        rank_table(_mixed_summary(), (2011,), failure_rule="ignore")
+
+
+def test_both_rulings_are_available_on_the_real_run(returns: pd.Series) -> None:
+    """Both must be computable so the report can show them side by side."""
+    summary = _mixed_summary()
+    for rule in ("drop", "worst_rank"):
+        champion = select_champion(summary, (2011, 2012), failure_rule=rule)
+        table, agrees = confirm(summary, champion, (2011, 2012), failure_rule=rule)
+        assert not table.empty
+        assert agrees
