@@ -2,7 +2,11 @@
 data/
 *.csv
 *.parquet
-reports/
+
+# Generated reports ARE committed so the README links resolve on a fresh
+# clone. The per-(model, origin) backtest cache is not: it is 1.6 MB of
+# regenerable derived data, keyed by the pre-registration hash.
+reports/backtest_cache/
 
 # Python
 __pycache__/
