@@ -54,6 +54,7 @@ import io
 from pathlib import Path
 from typing import Any
 
+import markdown as markdown_lib
 import matplotlib
 
 matplotlib.use("Agg")  # headless: the report is written, never displayed.
@@ -84,6 +85,13 @@ MIN_PERIODS = 11
 #: to this — shorter blocks narrow them, longer blocks widen them — so it
 #: is a reported parameter, not a hidden constant.
 DEFAULT_BLOCK = 20
+
+#: Where the hand-written prose lives. Each report section that is
+#: argument rather than arithmetic is kept in its own markdown file and
+#: inlined at generation time, so the numbers around it are always the
+#: ones the run produced and the prose can never quietly drift out of
+#: date beside them.
+DEFAULT_NARRATIVE_DIR = Path("docs/narrative")
 
 #: Report order. Grouped: moments, then risk measures, then raw tail
 #: quantiles, then clustering, then the path functional.
@@ -431,6 +439,26 @@ def validate(
 # --- report ----------------------------------------------------------------
 
 
+def load_narrative(name: str, narrative_path: str | Path | None) -> str | None:
+    """Read one prose section, or None when it is not available.
+
+    Returning None rather than raising keeps the generators usable in
+    tests and on a fresh checkout that has no prose yet: the caller
+    falls back to the pre-filled TODO block.
+    """
+    if narrative_path is None:
+        return None
+    candidate = Path(narrative_path) / name
+    if not candidate.exists():
+        return None
+    return candidate.read_text(encoding="utf-8").strip()
+
+
+def markdown_to_html(text: str) -> str:
+    """Render an inlined prose section for the HTML twin."""
+    return markdown_lib.markdown(text, extensions=["tables"])
+
+
 def _figure_to_png(figure: plt.Figure) -> bytes:
     """Render to PNG bytes. Metadata is stripped so runs are byte-identical."""
     buffer = io.BytesIO()
@@ -657,6 +685,7 @@ def make_report(
     n_boot: int = DEFAULT_N_BOOT,
     boot_seed: int = 7,
     boot_drawdowns: np.ndarray | None = None,
+    narrative_path: str | Path | None = DEFAULT_NARRATIVE_DIR,
 ) -> str:
     """Self-contained HTML. Embeds plots as base64 PNGs. Returns the path.
 
@@ -711,6 +740,37 @@ def make_report(
     )
 
     seed_text = "not recorded" if seed is None else str(seed)
+
+    scope = load_narrative("validation_scope.md", narrative_path)
+    thresholds = load_narrative("validation_thresholds.md", narrative_path)
+    failure_prose = load_narrative("validation_failure_modes.md", narrative_path)
+
+    scope_html = (
+        "<h2>0. Scope: what the model is meant to reproduce, and what it is "
+        f"not</h2>{markdown_to_html(scope)}"
+        if scope
+        else ""
+    )
+    thresholds_html = markdown_to_html(thresholds) if thresholds else ""
+    if failure_prose:
+        failure_html = markdown_to_html(failure_prose)
+    else:
+        failure_html = f"""<div class="todo">
+<p><b>TODO — narrative to be written.</b> The numbers below are pre-filled;
+the interpretation is not.</p>
+<ul>{failure_lines}</ul>
+<p><b>Spread mismatches ({n_wide}):</b></p>
+<ul>{wide_lines or "<li>Every statistic's spread sits within the bounds.</li>"}</ul>
+</div>"""
+
+    figures_html = "".join(
+        f"<h3>{html.escape(title)}</h3>"
+        f"<figure><img alt='{html.escape(title)}' "
+        f"src='data:image/png;base64,{base64.b64encode(payload).decode('ascii')}'>"
+        f"</figure>"
+        for title, payload in figures
+    )
+
     document = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <title>Brent synthetic-path validation</title>
@@ -738,9 +798,9 @@ def make_report(
  code {{ background: #f2f2f2; padding: .1rem .3rem; }}
 </style></head><body>
 <h1>Brent synthetic-path validation</h1>
-<p><i>The in-sample descriptive check on the champion fitted to all data. The
-out-of-time comparison that selected it is in
-<a href="model_comparison.html">model_comparison.html</a>.</i></p>
+<p><i>This is the in-sample descriptive check on the champion model fitted to all
+data. The out-of-time comparison that selected it, and the evidence that
+qualifies it, are in <a href="model_comparison.html">model_comparison.html</a>.</i></p>
 <p class="summary"><b>{n_pass} of {n_total}</b> independent statistics fall inside
 the real bootstrap band, and <b>{n_wide}</b> show a spread outside
 {DISPERSION_BOUNDS[0]:g}-{DISPERSION_BOUNDS[1]:g}x the real one. Synthetic paths come
@@ -749,7 +809,7 @@ stationary block bootstrap of the real returns at the same horizon. Every
 statistic is measured per path on {paths.shape[1]} days, on both sides — VaR
 rows are the signed tail quantiles under another name and are excluded from
 the count above.</p>
-
+{scope_html}
 <h2>1. Run configuration</h2>
 <table>
 <tr><td class="stat">Real observations</td><td>{real.size}</td></tr>
@@ -760,38 +820,29 @@ the count above.</p>
 <tr><td class="stat">Simulation seed</td><td>{html.escape(seed_text)}</td></tr>
 <tr><td class="stat">Bootstrap seed</td><td>{boot_seed}</td></tr>
 {params_rows}
-<tr><td class="stat">persistence (α + γ·E[z²1{{z&lt;0}}] + β)</td><td>{fit.persistence:.6f}</td></tr>
-<tr><td class="stat">leverage weight E[z²1{{z&lt;0}}]</td><td>{fit.leverage_weight:.6f}</td></tr>
+<tr><td class="stat">persistence (α + γ·E[z²1{{{{z&lt;0}}}}] + β)</td><td>{fit.persistence:.6f}</td></tr>
+<tr><td class="stat">leverage weight E[z²1{{{{z&lt;0}}}}]</td><td>{fit.leverage_weight:.6f}</td></tr>
 <tr><td class="stat">forecast variance σ²(T+1)</td><td>{fit.forecast_variance:.6g}</td></tr>
 <tr><td class="stat">unconditional variance</td><td>{fit.unconditional_variance:.6g}</td></tr>
 </table>
 
-<h2>2. Acceptance table</h2>
+<h2>2. Acceptance thresholds and why</h2>
+{thresholds_html}
+<h3>Acceptance table</h3>
 <p>A statistic PASSES when the synthetic median lies inside the real
 2.5–97.5% bootstrap band. <code>Position</code> is 0 inside the band, and
 otherwise counts band-widths beyond the breached bound (negative below,
 positive above). <code>Spread</code> is the synthetic 2.5–97.5% width over the
-real one: a model can sit on the median and still be far too variable, and
-only this column sees that. VaR and ES are positive loss magnitudes; the
-percentile rows are signed returns. Rows marked <span class="alias">= -…</span>
-are the same number as another row, reported under both conventional names and
-counted once.</p>
+real one. VaR and ES are positive loss magnitudes; the percentile rows are
+signed returns. Rows marked <span class="alias">= -…</span> are the same number
+as another row, counted once.</p>
 {_results_table_html(results_df)}
 
 <h2>3. Plots</h2>
-{figure_blocks}
+{figures_html}
 
 <h2>4. Failure modes</h2>
-<div class="todo">
-<p><b>TODO — narrative to be written.</b> The numbers below are pre-filled;
-the interpretation is not.</p>
-<ul>{failure_lines}</ul>
-<p><b>Spread mismatches ({n_wide}):</b></p>
-<ul>{wide_lines or "<li>Every statistic's spread sits within the bounds.</li>"}</ul>
-<p><i>TODO: state whether the ACF decay mismatch is acceptable for the
-intended use, and whether the block length of {block} days is doing
-material work in the width of these bands.</i></p>
-</div>
+{failure_html}
 </body></html>"""
 
     destination = Path(out_path)
@@ -840,6 +891,7 @@ def make_markdown_report(
     n_boot: int = DEFAULT_N_BOOT,
     boot_seed: int = 7,
     boot_drawdowns: np.ndarray | None = None,
+    narrative_path: str | Path | None = DEFAULT_NARRATIVE_DIR,
 ) -> str:
     """Markdown twin of :func:`make_report`. Returns the path.
 
@@ -907,11 +959,46 @@ def make_markdown_report(
 
     seed_text = "not recorded" if seed is None else str(seed)
     low, high = DISPERSION_BOUNDS
+
+    scope = load_narrative("validation_scope.md", narrative_path)
+    thresholds = load_narrative("validation_thresholds.md", narrative_path)
+    failure_prose = load_narrative("validation_failure_modes.md", narrative_path)
+
+    scope_block = (
+        f"## 0. Scope: what the model is meant to reproduce, and what it is not\n\n"
+        f"{scope}\n\n"
+        if scope
+        else ""
+    )
+    thresholds_block = (
+        f"{thresholds}\n\n### Acceptance table\n\n"
+        if thresholds
+        else "### Acceptance table\n\n"
+    )
+    if failure_prose:
+        failure_block = failure_prose
+    else:
+        failure_block = f"""> **TODO — narrative to be written.** The numbers below are pre-filled; the
+> interpretation is not.
+
+**Outside the band ({len(failures)}):**
+
+{failure_lines}
+
+**Spread mismatches ({n_wide}):**
+
+{wide_lines}"""
+
+    figure_block = "\n\n".join(
+        f"### {title}\n\n![{title}]({figure_dir.name}/{FIGURE_SLUGS[title]}.png)"
+        for title, _ in figures
+    )
+
     document = f"""# Brent synthetic-path validation
 
-*The in-sample descriptive check on the champion fitted to all data. The
-out-of-time comparison that selected it is in
-[model_comparison.md](model_comparison.md).*
+*This is the in-sample descriptive check on the champion model fitted to
+all data. The out-of-time comparison that selected it, and the evidence
+that qualifies it, are in [model_comparison.md](model_comparison.md).*
 
 **{n_pass} of {n_total}** independent statistics fall inside the real bootstrap
 band, and **{n_wide}** show a spread outside {low:g}-{high:g}x the real one.
@@ -922,7 +1009,7 @@ horizon. Every statistic is measured per path on {paths.shape[1]} days, on both
 sides. VaR rows are the signed tail quantiles under another name and are
 excluded from the count above.
 
-## 1. Run configuration
+{scope_block}## 1. Run configuration
 
 | Setting | Value |
 |---|---:|
@@ -939,9 +1026,9 @@ excluded from the count above.
 | forecast variance sigma^2(T+1) | {fit.forecast_variance:.6g} |
 | unconditional variance | {fit.unconditional_variance:.6g} |
 
-## 2. Acceptance table
+## 2. Acceptance thresholds and why
 
-A statistic PASSES when the synthetic median lies inside the real 2.5-97.5%
+{thresholds_block}A statistic PASSES when the synthetic median lies inside the real 2.5-97.5%
 bootstrap band. `Position` is 0 inside the band, and otherwise counts
 band-widths beyond the breached bound (negative below, positive above).
 `Spread` is the synthetic 2.5-97.5% width over the real one: a model can sit on
@@ -954,29 +1041,45 @@ conventional names and counted once.
 
 ## 3. Plots
 
-{chr(10).join(chr(10).join([line, ""]) for line in figure_lines)}
+{figure_block}
 
 ## 4. Failure modes
 
-> **TODO — narrative to be written.** The numbers below are pre-filled; the
-> interpretation is not.
-
-**Outside the band ({len(failures)}):**
-
-{failure_lines}
-
-**Spread mismatches ({n_wide}):**
-
-{wide_lines}
-
-*TODO: state whether the ACF decay mismatch is acceptable for the intended use,
-and whether the block length of {block} days is doing material work in the width
-of these bands.*
+{failure_block}
 """
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(document, encoding="utf-8")
     return str(destination)
+
+
+
+def _markdown_table(results: pd.DataFrame) -> str:
+    header = (
+        "| Statistic | Synthetic median | Synthetic 2.5-97.5% | Real 2.5% | "
+        "Real median | Real 97.5% | Position | Spread | Result |\n"
+        "|---|---:|---:|---:|---:|---:|---:|---:|:--|"
+    )
+    lines = [header]
+    for row in results.itertuples():
+        verdict = "PASS" if row.passed else "**FAIL**"
+        spread = (
+            "n/a"
+            if not np.isfinite(row.dispersion_ratio)
+            else f"{row.dispersion_ratio:.2f}x"
+        )
+        if not row.dispersion_passed and np.isfinite(row.dispersion_ratio):
+            spread = f"**{spread}**"
+        label = row.label
+        if not row.independent:
+            label += f" *(= -{STAT_LABELS[DUPLICATE_STATS[row.statistic]]})*"
+        lines.append(
+            f"| {label} | {row.synthetic:.5f} | "
+            f"{row.synth_lo:.5f} to {row.synth_hi:.5f} | {row.boot_lo:.5f} | "
+            f"{row.boot_median:.5f} | {row.boot_hi:.5f} | {row.position:+.2f} | "
+            f"{spread} | {verdict} |"
+        )
+    return "\n".join(lines)
 
 
 def run_validation(
@@ -988,6 +1091,7 @@ def run_validation(
     boot_seed: int = 7,
     out_path: str = "reports/validation.html",
     markdown_path: str | None = "reports/validation.md",
+    narrative_path: str | Path | None = DEFAULT_NARRATIVE_DIR,
 ) -> str:
     """load returns → fit → simulate → bootstrap → validate → report.
     One call. Returns report path.
@@ -1012,6 +1116,7 @@ def run_validation(
         "n_boot": n_boot,
         "boot_seed": boot_seed,
         "boot_drawdowns": bands["max_drawdown"][3],
+        "narrative_path": narrative_path,
     }
     report_path = make_report(
         returns, fitted, paths, results, out_path=out_path, **shared

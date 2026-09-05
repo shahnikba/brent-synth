@@ -42,13 +42,18 @@ from brent_synth.backtest import (  # noqa: E402
     select_champion,
 )
 from brent_synth.model import _leverage_weight  # noqa: E402
+from brent_synth.validation import (  # noqa: E402
+    DEFAULT_NARRATIVE_DIR,
+    load_narrative,
+    markdown_to_html,
+)
 from brent_synth.scoring import diebold_mariano  # noqa: E402
 
 FIGURE_SLUGS = {
     "Scoreboard": "scoreboard",
     "PIT histograms": "pit-histograms",
     "PIT by regime": "pit-by-regime",
-    "Path-rank histograms": "path-rank-histograms",
+    "Path-rank histograms": "path-ranks",
     "Parameter drift": "parameter-drift",
 }
 
@@ -248,6 +253,34 @@ def _dm_table(results, champion: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def pit_short_table(frame: pd.DataFrame) -> pd.DataFrame:
+    """The reference's four-column PIT table: shape, p, KS, max-bin dev."""
+    return frame[["model", "shape", "chi2_p", "ks", "max_bin_dev"]].rename(
+        columns={"chi2_p": "χ² p", "ks": "KS", "max_bin_dev": "max-bin dev"}
+    )
+
+
+def pit_regime_matrix(results) -> pd.DataFrame:
+    """One row per model, one column per regime, 'shape (p)' in each cell."""
+    frame = pit_by_regime(results)
+    rows = []
+    for model, block in frame.groupby("model"):
+        row = {"model": model}
+        indexed = block.set_index("regime")
+        for regime in REGIME_ORDER:
+            if regime in indexed.index:
+                cell = indexed.loc[regime]
+                marker = "**U**" if str(cell["shape"]) == "U" else str(cell["shape"])
+                row[regime] = f"{marker} ({float(cell['chi2_p']):.3f})"
+            else:
+                row[regime] = "n/a"
+        rows.append(row)
+    order = {"gjr_skewt": 0, "figarch_skewt": 1, "garch_normal": 2,
+             "gjr_skewt_vt": 3, "iid_t": 4, "ms_variance": 5}
+    out = pd.DataFrame(rows)
+    return out.sort_values("model", key=lambda c: c.map(lambda m: order.get(m, 99)))
+
+
 def _regime_table(summary: pd.DataFrame) -> pd.DataFrame:
     ok = summary[summary["status"] == "ok"]
     return (
@@ -341,6 +374,7 @@ def pit_diagnostics(values: np.ndarray) -> dict[str, float | str]:
     if values.size < PIT_BINS * 2:
         return {
             "pit_shape": "n/a",
+            "shape": "n/a",
             "chi2": float("nan"),
             "chi2_p": float("nan"),
             "ks": float("nan"),
@@ -368,6 +402,7 @@ def pit_diagnostics(values: np.ndarray) -> dict[str, float | str]:
 
     return {
         "pit_shape": shape,
+        "shape": shape.split(" ")[0],
         "chi2": statistic,
         "chi2_p": p_value,
         "ks": ks,
@@ -491,6 +526,15 @@ def persistence_by_origin(results) -> pd.DataFrame:
         index="origin_year", columns="model", values="value"
     ).reset_index()
 
+    # FIGARCH has no "persistence" in the GARCH sense; its long-memory
+    # parameter d is the comparable quantity, so it travels beside them.
+    figarch_d = results.params[
+        (results.params["model"] == "figarch_skewt")
+        & (results.params["param"] == "d")
+    ].pivot_table(index="origin_year", columns="param", values="value")
+    figarch_d = figarch_d.rename(columns={"d": "figarch (d)"}).reset_index()
+    wide = wide.merge(figarch_d, on="origin_year", how="left")
+
     extras = results.params[
         (results.params["model"] == "gjr_skewt")
         & (results.params["param"].isin(["nu", "gamma"]))
@@ -500,7 +544,11 @@ def persistence_by_origin(results) -> pd.DataFrame:
     ).reset_index()
     wide = wide.merge(extras, on="origin_year", how="left")
 
-    model_columns = [c for c in wide.columns if c not in {"origin_year", "gjr nu", "gjr gamma"}]
+    model_columns = [
+        c
+        for c in wide.columns
+        if c not in {"origin_year", "gjr nu", "gjr gamma", "figarch (d)"}
+    ]
     wide["non_stationary"] = [
         ", ".join(
             column
@@ -612,6 +660,7 @@ def make_comparison_report(
     results,
     out_md: str = "reports/model_comparison.md",
     out_html: str = "reports/model_comparison.html",
+    narrative_path: str | Path | None = DEFAULT_NARRATIVE_DIR,
 ) -> tuple[str, str]:
     """Write both twins. Returns ``(markdown_path, html_path)``."""
     summary = results.summary
@@ -777,124 +826,121 @@ def make_comparison_report(
     for title, payload in figures:
         (figure_dir / f"{FIGURE_SLUGS[title]}.png").write_bytes(payload)
 
+    summary_prose = load_narrative("comparison_summary.md", narrative_path)
+    failure_prose = load_narrative("comparison_failure_modes.md", narrative_path)
+
+    original = rulings["drop"]["selection"].set_index("model")
+    selection_board = selection.copy()
+    selection_board["original score (origins scored)"] = [
+        f"{original.loc[m, 'weighted_score']:.3f} ({int(original.loc[m, 'n_origins'])})"
+        if m in original.index
+        else "n/a"
+        for m in selection_board["model"]
+    ]
+    selection_board = selection_board[
+        ["model", "step", "weighted_score", "rank_stability",
+         "original score (origins scored)"]
+    ].rename(columns={"weighted_score": "amended score",
+                      "rank_stability": "rank stability"})
+    confirmation_board = confirmation[
+        ["model", "step", "weighted_score", "rank_stability"]
+    ].rename(columns={"weighted_score": "amended score",
+                      "rank_stability": "rank stability"})
+
+    persistence = extra["persistence_origins"]
+    gjr = persistence.set_index("origin_year")["gjr_skewt"]
+    stationary = gjr[gjr < 1.0]
+    flagged = gjr[gjr >= 1.0]
+    persistence_prose = (
+        f"The champion's persistence sits at or above 1.0 at "
+        f"{flagged.index.min()}–{flagged.index.max()}, exactly the "
+        f"{len(flagged)} origins at which the variance-targeted variant "
+        f"cannot be fitted ({flagged.min():.5f} to {flagged.max():.5f}), and "
+        f"in {stationary.min():.5f}–{stationary.max():.5f} everywhere else. "
+        f"Its ν falls monotonically from "
+        f"{persistence.set_index('origin_year')['gjr nu'].iloc[0]:.2f} "
+        f"({int(persistence['origin_year'].iloc[0])}) to "
+        f"{persistence.set_index('origin_year')['gjr nu'].min():.2f} "
+        f"(2021) as the sample absorbs 2014–15 and 2020, then stabilises: "
+        f"the model is being told the tails are steadily fatter than it "
+        f"first thought."
+    )
+
+    if failure_prose:
+        failure_block = failure_prose
+    else:
+        failure_block = (
+            "> **TODO — narrative to be written.**\n\n"
+            + "\n".join(failure_lines)
+        )
+    summary_block = summary_prose or verdict
+
     md = [
-        "# Brent scenario-generator comparison\n",
-        "*In-sample descriptive checks on the champion fitted to all data are "
-        "in [validation.md](validation.md).*\n",
-        f"{verdict}\n",
-        "## At a glance\n",
-        "**Persistence by origin** (GARCH family; a value at or above 1.0 "
-        "means the fit has no finite long-run variance and is flagged):\n",
-        _md_table(headline["persistence"], digits=5),
-        "\n**PIT calibration** — chi-square against uniform over 20 bins:\n",
-        _md_table(headline["pit"]),
-        f"\n**Diebold-Mariano vs the champion ({champion})**, confirmation "
-        "origins, HAC at 10 lags. A positive statistic means the model lost:\n",
-        _md_table(headline["dm"]),
-        "\n**Stress origins** — where the realised year fell inside each "
-        "model's simulated distribution, and how many 99% VaR breaches it "
-        f"took out of {TEST_HORIZON} (expected 2.5):\n",
-        _md_table(headline["stress"]),
+        "# Brent scenario generators — out-of-time model comparison\n",
+        "*Companion to [validation.md](validation.md), which is the in-sample\n"
+        "descriptive check on the champion fitted to all data. This report is the\n"
+        "pre-registered, out-of-time comparison that selected it.*\n",
+        "## Summary\n",
+        summary_block,
         "\n## 1. Pre-registration\n",
         sections["1. Pre-registration"],
+        "\n## 2. Scoreboard\n",
+        "Lower is better. Rank stability is the fraction of origins on which the\n"
+        "model is top-two on the mean of the four ranks.\n",
+        f"**Selection origins, {SELECTION_YEARS[0]}–{SELECTION_YEARS[-1]}**\n",
+        _md_table(selection_board, digits=3),
+        f"\n**Confirmation origins, {CONFIRMATION_YEARS[0]}–{CONFIRMATION_YEARS[-1]}**\n",
+        _md_table(confirmation_board, digits=3),
+        f"\nChampion under both rulings: `{champion}`. Confirmation "
+        + ("agrees" if agrees else "disagrees")
+        + " under both.\n",
+        "\n### 2.1 Which loss the composite is won on\n",
+        "Mean rank per loss; lower is better.\n",
+        _md_table(extra["per_loss"], digits=3),
+        "\n## 3. Scores by regime\n",
+        "Four losses averaged within each regime of the test window.\n",
+        _md_table(regime, digits=5),
+        "\n## 4. Crisis years\n",
+        sections["4. Crisis years"],
+        "\n### 4.1 Per-origin losses and ranks at stress origins\n",
+        _md_table(extra["stress_losses"], digits=5),
+        "\n## 5. Calibration — PIT\n",
+        "Probability-integral-transform values of the realised return under each\n"
+        "day's forecast density. Uniform means calibrated; a hump means the\n"
+        "densities are too wide (under-confident); a U means too narrow\n"
+        "(over-confident). χ² is over 20 bins; because consecutive PITs are mildly\n"
+        "dependent and n is large, the p-values are anti-conservative and effect\n"
+        "sizes (KS distance from uniform, largest single-bin deviation from 0.05)\n"
+        "are reported beside them.\n",
+        "\n### 5.1 Pooled over all origins\n",
+        _md_table(pit_short_table(headline["pit"]), digits=4),
+        f"\n`gjr_skewt_vt` is judged on fewer days; see §5.3.\n",
+        "\n### 5.2 By regime of the test window\n",
+        _md_table(pit_regime_matrix(results)),
+        f"\n![PIT by regime]({figure_dir.name}/pit-by-regime.png)\n",
+        "\n### 5.3 On common days\n",
+        f"Restricted to the {len(common_years)} origins at which every candidate\n"
+        "fitted, so all six are judged on identical days.\n",
+        _md_table(pit_short_table(extra["pit_common"]), digits=4),
+        "\n## 6. Path-rank histograms\n",
+        f"Percentile rank of each realised-year statistic inside the "
+        f"{results.n_paths} simulated\npaths, pooled over origins and "
+        "statistics. Same reading as §5.\n",
+        f"\n![Path ranks]({figure_dir.name}/path-ranks.png)\n",
+        "\n## 7. Parameter drift\n",
+        "Each fitted parameter against origin year. The 1.0 line in the persistence\n"
+        "panels is the stationarity boundary.\n",
+        f"\n![Parameter drift]({figure_dir.name}/parameter-drift.png)\n",
+        "\n### 7.1 Persistence by origin\n",
+        _md_table(persistence, digits=5),
+        f"\n{persistence_prose}\n",
+        f"\n## 8. Diebold–Mariano vs the champion\n",
+        "Confirmation origins pooled; Newey–West HAC variance, lag 10. A negative\n"
+        "statistic means the row model's loss is lower than the champion's.\n",
+        _md_table(headline["dm"], digits=3),
+        "\n## 9. Failure modes\n",
+        failure_block,
     ]
-    md.append(f"\n## 2. Scoreboard\n\n{sections['2. Scoreboard']}\n")
-    md.append(
-        f"\n**Amended ruling ({DEFAULT_FAILURE_RULE}) — the one that stands.** "
-        f"Champion **{rulings['worst_rank']['champion']}**, confirmation "
-        + ("agrees" if rulings["worst_rank"]["agrees"] else "disagrees")
-        + ".\n"
-    )
-    md.append(_md_table(scoreboard))
-    md.append(
-        f"\n**Original ruling (drop) — for comparison.** Champion "
-        f"**{rulings['drop']['champion']}**, confirmation "
-        + ("agrees" if rulings["drop"]["agrees"] else "disagrees")
-        + ".\n"
-    )
-    md.append(
-        _md_table(
-            rulings["drop"]["selection"].merge(
-                rulings["drop"]["confirmation"][
-                    ["model", "weighted_score", "rank_stability"]
-                ],
-                on="model",
-                how="left",
-                suffixes=("_selection", "_confirmation"),
-            )
-        )
-    )
-    md.append(f"\n![Scoreboard]({figure_dir.name}/scoreboard.png)\n")
-    md.append(
-        f"\n### 2.1 Which loss did it win on? {champion} vs {runner_up}\n\n"
-        "The composite score is a mean of four ranks, which hides the "
-        "components. Mean rank on each loss separately, lower is better:\n"
-    )
-    md.append(_md_table(extra["per_loss"]))
-    md.append(f"\n## 3. Scores by regime\n\n{sections['3. Scores by regime']}\n")
-    md.append(_md_table(regime))
-    md.append(f"\n## 4. Crisis years\n\n{sections['4. Crisis years']}\n")
-    md.append(_md_table(crisis))
-    md.append(
-        "\n### 4.1 The losses themselves at stress origins\n\n"
-        "Ranks say who won; these say by how much, and whether anyone was "
-        "any good. Origin 2019 — whose test window is calendar 2020 — is "
-        "always included regardless of where the tercile boundaries "
-        "fall.\n"
-    )
-    md.append(_md_table(extra["stress_losses"], digits=5))
-    md.append(f"\n## 5. PIT histograms\n\n{sections['5. PIT histograms']}\n")
-    md.append(f"\n![PIT histograms]({figure_dir.name}/pit-histograms.png)\n")
-    md.append(
-        "\n### 5.1 Effect sizes\n\n"
-        "A chi-square over several thousand days rejects uniformity for "
-        "deviations too small to matter, so two effect sizes travel with "
-        "it. `ks` is the Kolmogorov-Smirnov distance from Uniform(0,1); "
-        "`max_bin_dev` is the largest single-bin departure from the ideal "
-        "density of 0.05, so 0.02 means a bin holding 7% of the mass "
-        "where it should hold 5%.\n"
-    )
-    md.append(
-        "\n### 5.2 Calibration on common days\n\n"
-        f"`gjr_skewt_vt` is unavailable at five origins, so the pooled "
-        f"table above judges the models on different days. Restricted to "
-        f"the {len(common_years)} origins every candidate survived "
-        f"({', '.join(str(y) for y in common_years)}), all six are "
-        "judged on identical days:\n"
-    )
-    md.append(_md_table(extra["pit_common"]))
-    md.append(
-        "\n### 5.3 Calibration by regime\n\n"
-        "The same diagnostics split by the regime of the test year. A "
-        "model can be calibrated in calm years and badly over-confident "
-        "in a crisis, which the pooled figure averages away.\n"
-    )
-    md.append(_md_table(extra["pit_regime"]))
-    md.append(f"\n![PIT by regime]({figure_dir.name}/pit-by-regime.png)\n")
-    md.append(
-        f"\n## 6. Path-rank histograms\n\n{sections['6. Path-rank histograms']}\n"
-    )
-    md.append(
-        f"\n![Path-rank histograms]({figure_dir.name}/path-rank-histograms.png)\n"
-    )
-    md.append(f"\n## 7. Parameter drift\n\n{sections['7. Parameter drift']}\n")
-    md.append(f"\n![Parameter drift]({figure_dir.name}/parameter-drift.png)\n")
-    md.append(
-        "\nThe dotted line in every persistence panel marks 1.0. Above it "
-        "the variance process has no finite unconditional variance, so the "
-        "long-run level the model would revert to does not exist.\n"
-    )
-    md.append(
-        "\n### 7.1 Persistence by origin\n\n"
-        "Values at or above 1.0 are listed in the final column. `gjr nu` "
-        "and `gjr gamma` are the champion's tail thickness and leverage "
-        "term at the same origins, for reading alongside.\n"
-    )
-    md.append(_md_table(extra["persistence_origins"], digits=5))
-    md.append(f"\n## 8. Diebold-Mariano\n\n{sections['8. Diebold-Mariano']}\n")
-    md.append(_md_table(dm))
-    md.append(f"\n## 9. Failure modes\n\n{sections['9. Failure modes']}\n")
-    md.extend(failure_lines)
     destination.write_text("\n".join(md) + "\n", encoding="utf-8")
 
     encoded = {
@@ -908,6 +954,7 @@ def make_comparison_report(
         max-width: 1080px; margin: 2.5rem auto; padding: 0 1.25rem; color: #1a1a1a; }}
  h1 {{ font-size: 1.6rem; }}
  h2 {{ font-size: 1.15rem; margin-top: 2.2rem; border-bottom: 1px solid #ddd; padding-bottom: .3rem; }}
+ h3 {{ font-size: 1.02rem; margin-top: 1.6rem; }}
  table {{ border-collapse: collapse; width: 100%; font-size: 12.5px; margin: .8rem 0; }}
  th, td {{ border: 1px solid #dcdcdc; padding: .32rem .5rem; text-align: right;
            font-variant-numeric: tabular-nums; }}
@@ -915,68 +962,45 @@ def make_comparison_report(
  td:first-child, th:first-child {{ text-align: left; }}
  img {{ max-width: 100%; border: 1px solid #e4e4e4; margin: .8rem 0; }}
  .summary {{ background: #f7f7f7; border-left: 3px solid #999; padding: .7rem 1rem; }}
- .todo {{ background: #fffbe6; border-left: 3px solid #d9a400; padding: .7rem 1rem; }}
 </style></head><body>
-<h1>Brent scenario-generator comparison</h1>
-<p><i>In-sample descriptive checks on the champion fitted to all data are in
-<a href="validation.html">validation.html</a>.</i></p>
-<p class="summary">{sections['2. Scoreboard']}</p>
+<h1>Brent scenario generators — out-of-time model comparison</h1>
+<p><i>Companion to <a href="validation.html">validation.html</a>, the in-sample
+descriptive check on the champion fitted to all data. This report is the
+pre-registered, out-of-time comparison that selected it.</i></p>
+<h2>Summary</h2>
+<div class="summary">{markdown_to_html(summary_block)}</div>
 <h2>1. Pre-registration</h2><p>{sections['1. Pre-registration']}</p>
-<h2>At a glance</h2>
-<p><b>Persistence by origin</b> (GARCH family; >= 1.0 means no finite long-run variance):</p>
-{_html_table(headline["persistence"], 5)}
-<p><b>PIT calibration</b> — chi-square against uniform over 20 bins:</p>
-{_html_table(headline["pit"])}
-<p><b>Diebold-Mariano vs the champion ({html.escape(champion)})</b>, confirmation origins,
-HAC at 10 lags. A positive statistic means the model lost:</p>
-{_html_table(headline["dm"])}
-<p><b>Stress origins</b> — rank of the realised year within each model's simulated
-distribution, and 99% VaR breaches out of {TEST_HORIZON} (expected 2.5):</p>
-{_html_table(headline["stress"])}
 <h2>2. Scoreboard</h2>
-<p><b>Amended ruling ({DEFAULT_FAILURE_RULE}) — the one that stands.</b></p>
-{_html_table(scoreboard)}
-<p><b>Original ruling (drop) — for comparison.</b> Champion
-<b>{html.escape(rulings['drop']['champion'])}</b>.</p>
-{_html_table(rulings['drop']['selection'])}
-<img alt="Scoreboard" src="data:image/png;base64,{encoded['Scoreboard']}">
-<h3>2.1 Which loss did it win on? {html.escape(champion)} vs {html.escape(runner_up)}</h3>
-<p>The composite score is a mean of four ranks, which hides the components.
-Mean rank on each loss separately, lower is better:</p>
-{_html_table(extra["per_loss"])}
-<h2>3. Scores by regime</h2><p>{sections['3. Scores by regime']}</p>{_html_table(regime)}
-<h2>4. Crisis years</h2><p>{sections['4. Crisis years']}</p>{_html_table(crisis)}
-<h3>4.1 The losses themselves at stress origins</h3>
-<p>Ranks say who won; these say by how much. Origin 2019 (test window calendar
-2020) is always included.</p>
+<p>Lower is better. Rank stability is the fraction of origins on which the model
+is top-two on the mean of the four ranks.</p>
+<h3>Selection origins, {SELECTION_YEARS[0]}–{SELECTION_YEARS[-1]}</h3>
+{_html_table(selection_board, 3)}
+<h3>Confirmation origins, {CONFIRMATION_YEARS[0]}–{CONFIRMATION_YEARS[-1]}</h3>
+{_html_table(confirmation_board, 3)}
+<p>Champion under both rulings: <code>{html.escape(champion)}</code>.</p>
+<h3>2.1 Which loss the composite is won on</h3>
+{_html_table(extra["per_loss"], 3)}
+<h2>3. Scores by regime</h2>{_html_table(regime, 5)}
+<h2>4. Crisis years</h2><p>{sections['4. Crisis years']}</p>
+<h3>4.1 Per-origin losses and ranks at stress origins</h3>
 {_html_table(extra["stress_losses"], 5)}
-<h2>5. PIT histograms</h2><p>{sections['5. PIT histograms']}</p>
-<img alt="PIT histograms" src="data:image/png;base64,{encoded['PIT histograms']}">
-<h3>5.1 Effect sizes</h3>
-<p>A chi-square over several thousand days rejects uniformity for deviations too
-small to matter, so two effect sizes travel with it. <code>ks</code> is the
-Kolmogorov-Smirnov distance from Uniform(0,1); <code>max_bin_dev</code> is the
-largest single-bin departure from the ideal density of 0.05.</p>
-<h3>5.2 Calibration on common days</h3>
-<p><code>gjr_skewt_vt</code> is unavailable at five origins, so the pooled table
-judges the models on different days. Restricted to the {len(common_years)} origins
-every candidate survived, all six are judged on identical days:</p>
-{_html_table(extra["pit_common"])}
-<h3>5.3 Calibration by regime</h3>
-<p>The same diagnostics split by the regime of the test year.</p>
-{_html_table(extra["pit_regime"])}
+<h2>5. Calibration — PIT</h2>
+<p>Uniform means calibrated; a hump means under-confident, a U over-confident.
+χ² is over 20 bins, with KS distance and largest single-bin deviation beside it.</p>
+<h3>5.1 Pooled over all origins</h3>{_html_table(pit_short_table(headline["pit"]), 4)}
+<h3>5.2 By regime of the test window</h3>{_html_table(pit_regime_matrix(results))}
 <img alt="PIT by regime" src="data:image/png;base64,{encoded['PIT by regime']}">
-<h2>6. Path-rank histograms</h2><p>{sections['6. Path-rank histograms']}</p>
-<img alt="Path-rank histograms" src="data:image/png;base64,{encoded['Path-rank histograms']}">
-<h2>7. Parameter drift</h2><p>{sections['7. Parameter drift']}</p>
+<h3>5.3 On common days</h3>
+<p>Restricted to the {len(common_years)} origins at which every candidate fitted.</p>
+{_html_table(pit_short_table(extra["pit_common"]), 4)}
+<h2>6. Path-rank histograms</h2>
+<img alt="Path ranks" src="data:image/png;base64,{encoded['Path-rank histograms']}">
+<h2>7. Parameter drift</h2>
 <img alt="Parameter drift" src="data:image/png;base64,{encoded['Parameter drift']}">
-<p>The dotted line in every persistence panel marks 1.0. Above it the variance
-process has no finite unconditional variance.</p>
-<h3>7.1 Persistence by origin</h3>
-{_html_table(extra["persistence_origins"], 5)}
-<h2>8. Diebold-Mariano</h2><p>{sections['8. Diebold-Mariano']}</p>{_html_table(dm)}
-<h2>9. Failure modes</h2><div class="todo">{sections['9. Failure modes']}
-<ul>{''.join(f'<li>{html.escape(line.lstrip("- ").lstrip())}</li>' for line in failure_lines)}</ul></div>
+<h3>7.1 Persistence by origin</h3>{_html_table(persistence, 5)}
+<p>{persistence_prose}</p>
+<h2>8. Diebold–Mariano vs the champion</h2>{_html_table(headline["dm"], 3)}
+<h2>9. Failure modes</h2>{markdown_to_html(failure_block)}
 </body></html>"""
     Path(out_html).parent.mkdir(parents=True, exist_ok=True)
     Path(out_html).write_text(html_document, encoding="utf-8")

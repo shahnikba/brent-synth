@@ -252,13 +252,15 @@ def test_report_is_written_and_self_contained(
         seed=42,
         n_boot=N_BOOT,
         boot_drawdowns=bands["max_drawdown"][3],
+        narrative_path=None,
     )
     text = out.read_text(encoding="utf-8")
 
     assert path == str(out)
     assert text.count("data:image/png;base64,") == 5  # all five plots embedded
     assert "http://" not in text and "https://" not in text  # nothing external
-    assert "Failure modes" in text and "TODO" in text
+    assert "Failure modes" in text
+    assert "TODO" in text  # no narrative supplied here, so the stub stands
     assert "PASS" in text or "FAIL" in text
     for label in ("Excess kurtosis", "Max drawdown", "ACF of r², lag 10"):
         assert label in text
@@ -561,7 +563,7 @@ def test_markdown_report_carries_the_same_content_as_the_html(
 
     for label in ("Excess kurtosis", "Max drawdown (median)", "ACF of r², lag 10"):
         assert label in text
-    assert "Failure modes" in text and "TODO" in text
+    assert "Failure modes" in text
     assert "γ/2" not in text
     assert "leverage weight" in text
     assert text.count("| PASS |") + text.count("| **FAIL** |") == len(STAT_NAMES)
@@ -647,3 +649,66 @@ def test_tests_never_write_into_the_project_reports_directory(tmp_path) -> None:
         else {}
     )
     assert before == after
+
+
+# --- narrative inlining ----------------------------------------------------
+
+
+def test_narrative_sections_are_inlined_when_present(
+    market: pd.Series, synth: np.ndarray, bands: dict, tmp_path
+) -> None:
+    """Prose from docs/narrative replaces the TODO stubs in both twins."""
+    narrative = tmp_path / "narrative"
+    narrative.mkdir()
+    (narrative / "validation_scope.md").write_text("SCOPE PROSE HERE.\n")
+    (narrative / "validation_thresholds.md").write_text("THRESHOLD PROSE **here**.\n")
+    (narrative / "validation_failure_modes.md").write_text(
+        "### 4.1 A heading\n\nFAILURE PROSE HERE.\n"
+    )
+
+    results = validate(synth, market, bands=bands)
+    shared = dict(
+        seed=42,
+        n_boot=N_BOOT,
+        boot_drawdowns=bands["max_drawdown"][3],
+        narrative_path=str(narrative),
+    )
+    md = tmp_path / "v.md"
+    html_out = tmp_path / "v.html"
+    make_markdown_report(market, _known_fit(), synth, results, out_path=str(md), **shared)
+    make_report(market, _known_fit(), synth, results, out_path=str(html_out), **shared)
+
+    md_text = md.read_text(encoding="utf-8")
+    html_text = html_out.read_text(encoding="utf-8")
+
+    for fragment in ("SCOPE PROSE HERE.", "THRESHOLD PROSE", "FAILURE PROSE HERE."):
+        assert fragment in md_text, fragment
+        assert fragment in html_text, fragment
+
+    assert "## 0. Scope" in md_text
+    assert "TODO" not in md_text  # the stub is gone once prose exists
+    assert "<strong>here</strong>" in html_text  # markdown was converted, not pasted
+    assert "**here**" not in html_text
+
+
+def test_missing_narrative_falls_back_to_the_stub(
+    market: pd.Series, synth: np.ndarray, bands: dict, tmp_path
+) -> None:
+    """A checkout with no prose must still produce a usable report."""
+    results = validate(synth, market, bands=bands)
+    out = tmp_path / "v.md"
+    make_markdown_report(
+        market,
+        _known_fit(),
+        synth,
+        results,
+        out_path=str(out),
+        seed=42,
+        n_boot=N_BOOT,
+        boot_drawdowns=bands["max_drawdown"][3],
+        narrative_path=tmp_path / "does-not-exist",
+    )
+    text = out.read_text(encoding="utf-8")
+    assert "TODO" in text
+    assert "## 0. Scope" not in text
+    assert "## 4. Failure modes" in text
