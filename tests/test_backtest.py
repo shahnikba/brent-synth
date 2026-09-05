@@ -391,3 +391,54 @@ def test_both_rulings_are_available_on_the_real_run(returns: pd.Series) -> None:
         table, agrees = confirm(summary, champion, (2011, 2012), failure_rule=rule)
         assert not table.empty
         assert agrees
+
+
+# --- report headline helpers ----------------------------------------------
+
+
+def test_pit_verdict_classifies_the_three_shapes() -> None:
+    """Flat, U and hump must be told apart, not just flagged as non-uniform."""
+    from brent_synth.comparison_report import pit_verdict
+
+    rng = np.random.default_rng(0)
+
+    flat = rng.uniform(size=4000)
+    shape, _, p_value = pit_verdict(flat)
+    assert shape == "flat" and p_value >= 0.05
+
+    # Over-confident: reality lands in the tails more than allowed.
+    u_shaped = np.concatenate(
+        [rng.uniform(0, 0.06, 1400), rng.uniform(0.94, 1, 1400), rng.uniform(size=800)]
+    )
+    assert pit_verdict(u_shaped)[0].startswith("U")
+
+    # Under-confident: density spread wider than needed.
+    humped = np.clip(rng.normal(0.5, 0.11, 4000), 0.001, 0.999)
+    assert pit_verdict(humped)[0].startswith("hump")
+
+
+def test_pit_verdict_needs_enough_days() -> None:
+    from brent_synth.comparison_report import pit_verdict
+
+    assert pit_verdict(np.array([0.1, 0.5, 0.9]))[0] == "n/a"
+
+
+def test_persistence_table_flags_the_garch_family(returns: pd.Series) -> None:
+    """The champion's own persistence crosses 1 at some origins."""
+    from brent_synth.comparison_report import persistence_table
+
+    params = pd.DataFrame(
+        [
+            {"model": "gjr_skewt", "origin_year": 2014, "param": p, "value": v}
+            for p, v in (
+                ("alpha", 0.06),
+                ("beta", 0.93),
+                ("gamma", 0.02),
+                ("nu", 6.0),
+                ("lambda", -0.1),
+            )
+        ]
+    )
+    table = persistence_table(params)
+    assert list(table["model"]) == ["gjr_skewt"]
+    assert float(table["2014"].iloc[0]) > 1.0

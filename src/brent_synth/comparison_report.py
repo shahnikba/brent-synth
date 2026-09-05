@@ -27,6 +27,8 @@ import pandas as pd  # noqa: E402
 from brent_synth.backtest import (  # noqa: E402
     BACKTEST_N_PATHS,
     CONFIRMATION_YEARS,
+    DEFAULT_FAILURE_RULE,
+    FAILURE_RULES,
     ORIGIN_YEARS,
     RANK_STATS,
     RANKING_LOSSES,
@@ -308,6 +310,94 @@ def _html_table(frame: pd.DataFrame, digits: int = 4) -> str:
 # --- report ----------------------------------------------------------------
 
 
+PIT_BINS = 20
+
+
+def pit_verdict(values: np.ndarray) -> tuple[str, float, float]:
+    """Classify a PIT histogram as U / hump / flat.
+
+    Chi-square against uniform over ``PIT_BINS`` equal bins gives the
+    p-value. The shape is read from where the mass sits: comparing the
+    two outer bins against the two central ones separates a model that
+    is over-confident (too much mass in the tails, U) from one that is
+    under-confident (too much in the middle, hump). A model that passes
+    the chi-square is reported flat regardless.
+    """
+    values = np.asarray(values, dtype="float64")
+    values = values[np.isfinite(values)]
+    if values.size < PIT_BINS * 2:
+        return "n/a", float("nan"), float("nan")
+
+    counts, _ = np.histogram(values, bins=PIT_BINS, range=(0.0, 1.0))
+    expected = values.size / PIT_BINS
+    statistic = float(((counts - expected) ** 2 / expected).sum())
+    from scipy import stats as sps
+
+    p_value = float(sps.chi2.sf(statistic, PIT_BINS - 1))
+
+    edges = counts[0] + counts[-1]
+    middle = counts[PIT_BINS // 2 - 1] + counts[PIT_BINS // 2]
+    if p_value >= 0.05:
+        shape = "flat"
+    elif edges > middle:
+        shape = "U (over-confident)"
+    else:
+        shape = "hump (under-confident)"
+    return shape, statistic, p_value
+
+
+def persistence_table(params: pd.DataFrame) -> pd.DataFrame:
+    """Persistence per (model, origin) for the GARCH family, wide by year."""
+    derived = _derived_persistence(params)
+    if derived.empty:
+        return pd.DataFrame()
+    wide = derived.pivot_table(
+        index="model", columns="origin_year", values="value"
+    ).reset_index()
+    wide.columns = [str(c) for c in wide.columns]
+    return wide
+
+
+def headline_tables(results, champion: str) -> dict[str, pd.DataFrame]:
+    """The numbers a reader needs before the scoreboard means anything."""
+    summary = results.summary
+    daily = results.daily
+
+    pit_rows = []
+    for model in sorted(summary["model"].unique()):
+        block = daily.loc[daily["model"] == model, "pit"].to_numpy()
+        shape, statistic, p_value = pit_verdict(block)
+        pit_rows.append(
+            {
+                "model": model,
+                "pit_shape": shape,
+                "chi2": statistic,
+                "chi2_p": p_value,
+                "n_days": int(block.size),
+            }
+        )
+
+    stress = summary[
+        (summary["regime"] == "stress") & (summary["status"] == "ok")
+    ]
+    stress_rows = stress[
+        [
+            "origin_year",
+            "model",
+            "rank_max_drawdown",
+            "rank_worst_day",
+            "exc99_count",
+        ]
+    ].sort_values(["origin_year", "model"])
+
+    return {
+        "persistence": persistence_table(results.params),
+        "pit": pd.DataFrame(pit_rows),
+        "dm": _dm_table(results, champion),
+        "stress": stress_rows,
+    }
+
+
 def make_comparison_report(
     results,
     out_md: str = "reports/model_comparison.md",
@@ -315,9 +405,28 @@ def make_comparison_report(
 ) -> tuple[str, str]:
     """Write both twins. Returns ``(markdown_path, html_path)``."""
     summary = results.summary
-    selection = score_models(summary, SELECTION_YEARS)
-    champion = select_champion(summary, SELECTION_YEARS)
-    confirmation, agrees = confirm(summary, champion, CONFIRMATION_YEARS)
+
+    # Both rulings on unavailable models, so the reader can see what the
+    # amendment did rather than take it on trust.
+    rulings = {}
+    for rule in FAILURE_RULES:
+        champion_rule = select_champion(summary, SELECTION_YEARS, failure_rule=rule)
+        table, agrees_rule = confirm(
+            summary, champion_rule, CONFIRMATION_YEARS, failure_rule=rule
+        )
+        rulings[rule] = {
+            "selection": score_models(summary, SELECTION_YEARS, failure_rule=rule),
+            "confirmation": table,
+            "champion": champion_rule,
+            "agrees": agrees_rule,
+        }
+
+    selection = rulings[DEFAULT_FAILURE_RULE]["selection"]
+    champion = rulings[DEFAULT_FAILURE_RULE]["champion"]
+    confirmation = rulings[DEFAULT_FAILURE_RULE]["confirmation"]
+    agrees = rulings[DEFAULT_FAILURE_RULE]["agrees"]
+    headline = headline_tables(results, champion)
+    champions_agree = len({r["champion"] for r in rulings.values()}) == 1
 
     figures = [
         ("Scoreboard", _plot_scoreboard(selection, confirmation)),
@@ -380,6 +489,14 @@ def make_comparison_report(
     sections = {
         "1. Pre-registration": (
             f"{registration_line}\n\n"
+            f"**Amendment 1 (post-hoc).** A candidate whose fit raises at an "
+            f"origin now takes the worst rank on all four losses there, "
+            f"instead of being dropped and the survivors re-ranked. Scoring a "
+            f"model only where it happened to work is survivorship bias. Both "
+            f"rulings are shown below. The champion is "
+            + ("**the same under both**." if champions_agree else
+               "**not the same under both** — see the two tables.")
+            + "\n\n"
             f"Origins {list(ORIGIN_YEARS)}; selection {list(SELECTION_YEARS)}; "
             f"confirmation {list(CONFIRMATION_YEARS)}. "
             f"{results.n_paths} paths per (model, origin), seed {results.seed}, "
@@ -442,11 +559,49 @@ def make_comparison_report(
         "# Brent scenario-generator comparison\n",
         "*In-sample descriptive checks on the champion fitted to all data are "
         "in [validation.md](validation.md).*\n",
-        "## 1. Pre-registration\n",
+        f"{verdict}\n",
+        "## At a glance\n",
+        "**Persistence by origin** (GARCH family; a value at or above 1.0 "
+        "means the fit has no finite long-run variance and is flagged):\n",
+        _md_table(headline["persistence"], digits=5),
+        "\n**PIT calibration** — chi-square against uniform over 20 bins:\n",
+        _md_table(headline["pit"]),
+        f"\n**Diebold-Mariano vs the champion ({champion})**, confirmation "
+        "origins, HAC at 10 lags. A positive statistic means the model lost:\n",
+        _md_table(headline["dm"]),
+        "\n**Stress origins** — where the realised year fell inside each "
+        "model's simulated distribution, and how many 99% VaR breaches it "
+        f"took out of {TEST_HORIZON} (expected 2.5):\n",
+        _md_table(headline["stress"]),
+        "\n## 1. Pre-registration\n",
         sections["1. Pre-registration"],
     ]
     md.append(f"\n## 2. Scoreboard\n\n{sections['2. Scoreboard']}\n")
+    md.append(
+        f"\n**Amended ruling ({DEFAULT_FAILURE_RULE}) — the one that stands.** "
+        f"Champion **{rulings['worst_rank']['champion']}**, confirmation "
+        + ("agrees" if rulings["worst_rank"]["agrees"] else "disagrees")
+        + ".\n"
+    )
     md.append(_md_table(scoreboard))
+    md.append(
+        f"\n**Original ruling (drop) — for comparison.** Champion "
+        f"**{rulings['drop']['champion']}**, confirmation "
+        + ("agrees" if rulings["drop"]["agrees"] else "disagrees")
+        + ".\n"
+    )
+    md.append(
+        _md_table(
+            rulings["drop"]["selection"].merge(
+                rulings["drop"]["confirmation"][
+                    ["model", "weighted_score", "rank_stability"]
+                ],
+                on="model",
+                how="left",
+                suffixes=("_selection", "_confirmation"),
+            )
+        )
+    )
     md.append(f"\n![Scoreboard]({figure_dir.name}/scoreboard.png)\n")
     md.append(f"\n## 3. Scores by regime\n\n{sections['3. Scores by regime']}\n")
     md.append(_md_table(regime))
@@ -493,7 +648,23 @@ def make_comparison_report(
 <a href="validation.html">validation.html</a>.</i></p>
 <p class="summary">{sections['2. Scoreboard']}</p>
 <h2>1. Pre-registration</h2><p>{sections['1. Pre-registration']}</p>
-<h2>2. Scoreboard</h2>{_html_table(scoreboard)}
+<h2>At a glance</h2>
+<p><b>Persistence by origin</b> (GARCH family; >= 1.0 means no finite long-run variance):</p>
+{_html_table(headline["persistence"], 5)}
+<p><b>PIT calibration</b> — chi-square against uniform over 20 bins:</p>
+{_html_table(headline["pit"])}
+<p><b>Diebold-Mariano vs the champion ({html.escape(champion)})</b>, confirmation origins,
+HAC at 10 lags. A positive statistic means the model lost:</p>
+{_html_table(headline["dm"])}
+<p><b>Stress origins</b> — rank of the realised year within each model's simulated
+distribution, and 99% VaR breaches out of {TEST_HORIZON} (expected 2.5):</p>
+{_html_table(headline["stress"])}
+<h2>2. Scoreboard</h2>
+<p><b>Amended ruling ({DEFAULT_FAILURE_RULE}) — the one that stands.</b></p>
+{_html_table(scoreboard)}
+<p><b>Original ruling (drop) — for comparison.</b> Champion
+<b>{html.escape(rulings['drop']['champion'])}</b>.</p>
+{_html_table(rulings['drop']['selection'])}
 <img alt="Scoreboard" src="data:image/png;base64,{encoded['Scoreboard']}">
 <h2>3. Scores by regime</h2><p>{sections['3. Scores by regime']}</p>{_html_table(regime)}
 <h2>4. Crisis years</h2><p>{sections['4. Crisis years']}</p>{_html_table(crisis)}
