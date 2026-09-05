@@ -26,6 +26,7 @@ import pandas as pd  # noqa: E402
 
 from brent_synth.backtest import (  # noqa: E402
     BACKTEST_N_PATHS,
+    rank_table,
     CONFIRMATION_YEARS,
     DEFAULT_FAILURE_RULE,
     FAILURE_RULES,
@@ -46,6 +47,7 @@ from brent_synth.scoring import diebold_mariano  # noqa: E402
 FIGURE_SLUGS = {
     "Scoreboard": "scoreboard",
     "PIT histograms": "pit-histograms",
+    "PIT by regime": "pit-by-regime",
     "Path-rank histograms": "path-rank-histograms",
     "Parameter drift": "parameter-drift",
 }
@@ -311,29 +313,49 @@ def _html_table(frame: pd.DataFrame, digits: int = 4) -> str:
 
 
 PIT_BINS = 20
+REGIME_ORDER = ("calm", "normal", "stress")
 
 
-def pit_verdict(values: np.ndarray) -> tuple[str, float, float]:
-    """Classify a PIT histogram as U / hump / flat.
+def pit_diagnostics(values: np.ndarray) -> dict[str, float | str]:
+    """Calibration of a pooled PIT sample, with effect sizes.
 
-    Chi-square against uniform over ``PIT_BINS`` equal bins gives the
-    p-value. The shape is read from where the mass sits: comparing the
-    two outer bins against the two central ones separates a model that
-    is over-confident (too much mass in the tails, U) from one that is
-    under-confident (too much in the middle, hump). A model that passes
-    the chi-square is reported flat regardless.
+    The chi-square p-value answers "is this distinguishable from
+    uniform", which at several thousand days answers yes to deviations
+    far too small to matter. So two effect sizes travel with it:
+
+    - ``ks``: the Kolmogorov-Smirnov distance from Uniform(0,1), the
+      largest gap between the empirical and ideal CDFs.
+    - ``max_bin_dev``: the largest single-bin departure from the ideal
+      density of 1/20, in the same units as the histogram — 0.02 means
+      a bin holding 7% of the mass where it should hold 5%.
+
+    ``shape`` reads where the mass sits: comparing the two outer bins
+    against the two central ones separates over-confidence (mass in the
+    tails, U) from under-confidence (mass in the middle, hump). A sample
+    that passes the chi-square is called flat regardless.
     """
+    from scipy import stats as sps
+
     values = np.asarray(values, dtype="float64")
     values = values[np.isfinite(values)]
     if values.size < PIT_BINS * 2:
-        return "n/a", float("nan"), float("nan")
+        return {
+            "pit_shape": "n/a",
+            "chi2": float("nan"),
+            "chi2_p": float("nan"),
+            "ks": float("nan"),
+            "max_bin_dev": float("nan"),
+            "n_days": int(values.size),
+        }
 
     counts, _ = np.histogram(values, bins=PIT_BINS, range=(0.0, 1.0))
     expected = values.size / PIT_BINS
     statistic = float(((counts - expected) ** 2 / expected).sum())
-    from scipy import stats as sps
-
     p_value = float(sps.chi2.sf(statistic, PIT_BINS - 1))
+
+    density = counts / values.size
+    max_bin_dev = float(np.abs(density - 1.0 / PIT_BINS).max())
+    ks = float(sps.kstest(values, "uniform").statistic)
 
     edges = counts[0] + counts[-1]
     middle = counts[PIT_BINS // 2 - 1] + counts[PIT_BINS // 2]
@@ -343,7 +365,72 @@ def pit_verdict(values: np.ndarray) -> tuple[str, float, float]:
         shape = "U (over-confident)"
     else:
         shape = "hump (under-confident)"
-    return shape, statistic, p_value
+
+    return {
+        "pit_shape": shape,
+        "chi2": statistic,
+        "chi2_p": p_value,
+        "ks": ks,
+        "max_bin_dev": max_bin_dev,
+        "n_days": int(values.size),
+    }
+
+
+def pit_verdict(values: np.ndarray) -> tuple[str, float, float]:
+    """Backwards-compatible triple: ``(shape, chi2, p)``."""
+    result = pit_diagnostics(values)
+    return (
+        str(result["pit_shape"]),
+        float(result["chi2"]),
+        float(result["chi2_p"]),
+    )
+
+
+def _daily_with_regime(results) -> pd.DataFrame:
+    """results.daily with the test-year regime label attached."""
+    labels = results.regimes[["origin_year", "regime"]]
+    return results.daily.merge(labels, on="origin_year", how="left")
+
+
+def pit_by_regime(results) -> pd.DataFrame:
+    """PIT calibration per model, split by the regime of the test year."""
+    daily = _daily_with_regime(results)
+    rows = []
+    for model in sorted(daily["model"].unique()):
+        for regime in REGIME_ORDER:
+            block = daily[(daily["model"] == model) & (daily["regime"] == regime)]
+            rows.append(
+                {
+                    "model": model,
+                    "regime": regime,
+                    **pit_diagnostics(block["pit"].to_numpy()),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def common_origins(summary: pd.DataFrame) -> list[int]:
+    """Origins where every candidate produced a fit.
+
+    Comparing calibration across models is only like-for-like on days
+    all of them saw; gjr_skewt_vt is unavailable at five origins, so the
+    pooled tables above judge it on a different, calmer subset.
+    """
+    ok = summary[summary["status"] == "ok"]
+    counts = ok.groupby("origin_year")["model"].nunique()
+    full = int(summary["model"].nunique())
+    return sorted(int(y) for y in counts[counts == full].index)
+
+
+def pit_on_common_origins(results) -> pd.DataFrame:
+    """The pooled PIT table restricted to origins every model survived."""
+    years = common_origins(results.summary)
+    daily = results.daily[results.daily["origin_year"].isin(years)]
+    rows = []
+    for model in sorted(daily["model"].unique()):
+        block = daily.loc[daily["model"] == model, "pit"].to_numpy()
+        rows.append({"model": model, **pit_diagnostics(block)})
+    return pd.DataFrame(rows)
 
 
 def persistence_table(params: pd.DataFrame) -> pd.DataFrame:
@@ -358,24 +445,147 @@ def persistence_table(params: pd.DataFrame) -> pd.DataFrame:
     return wide
 
 
+def per_loss_ranks(
+    summary: pd.DataFrame,
+    models: tuple[str, ...],
+    failure_rule: str = DEFAULT_FAILURE_RULE,
+) -> pd.DataFrame:
+    """Mean rank on each loss separately, per model, per period.
+
+    The composite score hides which of the four losses a winner actually
+    won on. Two models can finish a rank apart on the average while
+    trading wins across the components, which is a different claim
+    entirely.
+    """
+    rows = []
+    periods = {"selection": SELECTION_YEARS, "confirmation": CONFIRMATION_YEARS}
+    tables = {
+        label: rank_table(summary, years, failure_rule)
+        for label, years in periods.items()
+    }
+    for loss in RANKING_LOSSES:
+        row = {"loss": LOSS_LABELS[loss]}
+        for label, table in tables.items():
+            for model in models:
+                block = table[table["model"] == model]
+                row[f"{model} ({label})"] = (
+                    float(block[f"rank_{loss}"].mean()) if len(block) else float("nan")
+                )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def persistence_by_origin(results) -> pd.DataFrame:
+    """Persistence per origin for the GARCH family, with a flag column.
+
+    A fit at or above 1.0 has no finite unconditional variance. That is
+    reported here rather than left implicit, because nothing in the
+    ranking rule looks at it and the champion crosses the line at
+    several origins.
+    """
+    derived = _derived_persistence(results.params)
+    if derived.empty:
+        return pd.DataFrame()
+
+    wide = derived.pivot_table(
+        index="origin_year", columns="model", values="value"
+    ).reset_index()
+
+    extras = results.params[
+        (results.params["model"] == "gjr_skewt")
+        & (results.params["param"].isin(["nu", "gamma"]))
+    ].pivot_table(index="origin_year", columns="param", values="value")
+    extras = extras.rename(
+        columns={"nu": "gjr nu", "gamma": "gjr gamma"}
+    ).reset_index()
+    wide = wide.merge(extras, on="origin_year", how="left")
+
+    model_columns = [c for c in wide.columns if c not in {"origin_year", "gjr nu", "gjr gamma"}]
+    wide["non_stationary"] = [
+        ", ".join(
+            column
+            for column in model_columns
+            if np.isfinite(row[column]) and row[column] >= 1.0
+        )
+        or "-"
+        for _, row in wide.iterrows()
+    ]
+    wide.columns = [str(c) for c in wide.columns]
+    return wide
+
+
+def stress_origin_losses(results) -> pd.DataFrame:
+    """The four losses themselves at each stress origin, not just ranks.
+
+    Ranks say who won; the values say by how much, and whether anyone
+    was any good. Origin 2019 — whose test window is calendar 2020 — is
+    always included regardless of how the tercile boundaries fall, since
+    it is the crisis the whole exercise exists to survive.
+    """
+    summary = results.summary
+    stress_years = set(
+        summary.loc[summary["regime"] == "stress", "origin_year"].unique()
+    )
+    stress_years.add(2019)
+    block = summary[
+        summary["origin_year"].isin(sorted(stress_years))
+        & (summary["status"] == "ok")
+    ]
+    columns = [
+        "origin_year",
+        "regime",
+        "model",
+        *RANKING_LOSSES,
+        "rank_max_drawdown",
+        "rank_worst_day",
+    ]
+    return block[columns].sort_values(["origin_year", "model"])
+
+
+def _plot_pit_by_regime(results) -> bytes:
+    """Small multiples: one PIT histogram per model per regime."""
+    daily = _daily_with_regime(results)
+    models = sorted(daily["model"].unique())
+    figure, axes = plt.subplots(
+        len(REGIME_ORDER),
+        len(models),
+        figsize=(2.5 * len(models), 2.1 * len(REGIME_ORDER)),
+        squeeze=False,
+        sharex=True,
+    )
+    for row, regime in enumerate(REGIME_ORDER):
+        for column, model in enumerate(models):
+            axis = axes[row][column]
+            block = daily[(daily["model"] == model) & (daily["regime"] == regime)]
+            values = block["pit"].to_numpy()
+            if values.size:
+                axis.hist(
+                    values, bins=PIT_BINS, range=(0, 1), density=True, alpha=0.75
+                )
+            axis.axhline(1.0, ls="--", lw=1.0, color="0.3")
+            axis.set_ylim(0, 3.0)
+            axis.tick_params(labelsize=6.5)
+            if row == 0:
+                axis.set_title(model, fontsize=8)
+            if column == 0:
+                axis.set_ylabel(f"{regime}\nn={values.size}", fontsize=8)
+    figure.suptitle("PIT by model and regime — flat is calibrated", y=1.01)
+    figure.tight_layout()
+    return _png(figure)
+
+
 def headline_tables(results, champion: str) -> dict[str, pd.DataFrame]:
     """The numbers a reader needs before the scoreboard means anything."""
     summary = results.summary
     daily = results.daily
 
-    pit_rows = []
-    for model in sorted(summary["model"].unique()):
-        block = daily.loc[daily["model"] == model, "pit"].to_numpy()
-        shape, statistic, p_value = pit_verdict(block)
-        pit_rows.append(
-            {
-                "model": model,
-                "pit_shape": shape,
-                "chi2": statistic,
-                "chi2_p": p_value,
-                "n_days": int(block.size),
-            }
-        )
+    pit_rows = [
+        {
+            "model": model,
+            **pit_diagnostics(daily.loc[daily["model"] == model, "pit"].to_numpy()),
+        }
+        for model in sorted(summary["model"].unique())
+    ]
 
     stress = summary[
         (summary["regime"] == "stress") & (summary["status"] == "ok")
@@ -426,11 +636,23 @@ def make_comparison_report(
     confirmation = rulings[DEFAULT_FAILURE_RULE]["confirmation"]
     agrees = rulings[DEFAULT_FAILURE_RULE]["agrees"]
     headline = headline_tables(results, champion)
+    runner_up = str(
+        selection.loc[selection["model"] != champion, "model"].iloc[0]
+    )
+    extra = {
+        "per_loss": per_loss_ranks(summary, (champion, runner_up)),
+        "pit_regime": pit_by_regime(results),
+        "pit_common": pit_on_common_origins(results),
+        "persistence_origins": persistence_by_origin(results),
+        "stress_losses": stress_origin_losses(results),
+    }
+    common_years = common_origins(summary)
     champions_agree = len({r["champion"] for r in rulings.values()}) == 1
 
     figures = [
         ("Scoreboard", _plot_scoreboard(selection, confirmation)),
         ("PIT histograms", _plot_pit(results.daily)),
+        ("PIT by regime", _plot_pit_by_regime(results)),
         ("Path-rank histograms", _plot_path_ranks(summary)),
         ("Parameter drift", _plot_parameter_drift(results.params)),
     ]
@@ -603,12 +825,52 @@ def make_comparison_report(
         )
     )
     md.append(f"\n![Scoreboard]({figure_dir.name}/scoreboard.png)\n")
+    md.append(
+        f"\n### 2.1 Which loss did it win on? {champion} vs {runner_up}\n\n"
+        "The composite score is a mean of four ranks, which hides the "
+        "components. Mean rank on each loss separately, lower is better:\n"
+    )
+    md.append(_md_table(extra["per_loss"]))
     md.append(f"\n## 3. Scores by regime\n\n{sections['3. Scores by regime']}\n")
     md.append(_md_table(regime))
     md.append(f"\n## 4. Crisis years\n\n{sections['4. Crisis years']}\n")
     md.append(_md_table(crisis))
+    md.append(
+        "\n### 4.1 The losses themselves at stress origins\n\n"
+        "Ranks say who won; these say by how much, and whether anyone was "
+        "any good. Origin 2019 — whose test window is calendar 2020 — is "
+        "always included regardless of where the tercile boundaries "
+        "fall.\n"
+    )
+    md.append(_md_table(extra["stress_losses"], digits=5))
     md.append(f"\n## 5. PIT histograms\n\n{sections['5. PIT histograms']}\n")
     md.append(f"\n![PIT histograms]({figure_dir.name}/pit-histograms.png)\n")
+    md.append(
+        "\n### 5.1 Effect sizes\n\n"
+        "A chi-square over several thousand days rejects uniformity for "
+        "deviations too small to matter, so two effect sizes travel with "
+        "it. `ks` is the Kolmogorov-Smirnov distance from Uniform(0,1); "
+        "`max_bin_dev` is the largest single-bin departure from the ideal "
+        "density of 0.05, so 0.02 means a bin holding 7% of the mass "
+        "where it should hold 5%.\n"
+    )
+    md.append(
+        "\n### 5.2 Calibration on common days\n\n"
+        f"`gjr_skewt_vt` is unavailable at five origins, so the pooled "
+        f"table above judges the models on different days. Restricted to "
+        f"the {len(common_years)} origins every candidate survived "
+        f"({', '.join(str(y) for y in common_years)}), all six are "
+        "judged on identical days:\n"
+    )
+    md.append(_md_table(extra["pit_common"]))
+    md.append(
+        "\n### 5.3 Calibration by regime\n\n"
+        "The same diagnostics split by the regime of the test year. A "
+        "model can be calibrated in calm years and badly over-confident "
+        "in a crisis, which the pooled figure averages away.\n"
+    )
+    md.append(_md_table(extra["pit_regime"]))
+    md.append(f"\n![PIT by regime]({figure_dir.name}/pit-by-regime.png)\n")
     md.append(
         f"\n## 6. Path-rank histograms\n\n{sections['6. Path-rank histograms']}\n"
     )
@@ -617,6 +879,18 @@ def make_comparison_report(
     )
     md.append(f"\n## 7. Parameter drift\n\n{sections['7. Parameter drift']}\n")
     md.append(f"\n![Parameter drift]({figure_dir.name}/parameter-drift.png)\n")
+    md.append(
+        "\nThe dotted line in every persistence panel marks 1.0. Above it "
+        "the variance process has no finite unconditional variance, so the "
+        "long-run level the model would revert to does not exist.\n"
+    )
+    md.append(
+        "\n### 7.1 Persistence by origin\n\n"
+        "Values at or above 1.0 are listed in the final column. `gjr nu` "
+        "and `gjr gamma` are the champion's tail thickness and leverage "
+        "term at the same origins, for reading alongside.\n"
+    )
+    md.append(_md_table(extra["persistence_origins"], digits=5))
     md.append(f"\n## 8. Diebold-Mariano\n\n{sections['8. Diebold-Mariano']}\n")
     md.append(_md_table(dm))
     md.append(f"\n## 9. Failure modes\n\n{sections['9. Failure modes']}\n")
@@ -666,14 +940,40 @@ distribution, and 99% VaR breaches out of {TEST_HORIZON} (expected 2.5):</p>
 <b>{html.escape(rulings['drop']['champion'])}</b>.</p>
 {_html_table(rulings['drop']['selection'])}
 <img alt="Scoreboard" src="data:image/png;base64,{encoded['Scoreboard']}">
+<h3>2.1 Which loss did it win on? {html.escape(champion)} vs {html.escape(runner_up)}</h3>
+<p>The composite score is a mean of four ranks, which hides the components.
+Mean rank on each loss separately, lower is better:</p>
+{_html_table(extra["per_loss"])}
 <h2>3. Scores by regime</h2><p>{sections['3. Scores by regime']}</p>{_html_table(regime)}
 <h2>4. Crisis years</h2><p>{sections['4. Crisis years']}</p>{_html_table(crisis)}
+<h3>4.1 The losses themselves at stress origins</h3>
+<p>Ranks say who won; these say by how much. Origin 2019 (test window calendar
+2020) is always included.</p>
+{_html_table(extra["stress_losses"], 5)}
 <h2>5. PIT histograms</h2><p>{sections['5. PIT histograms']}</p>
 <img alt="PIT histograms" src="data:image/png;base64,{encoded['PIT histograms']}">
+<h3>5.1 Effect sizes</h3>
+<p>A chi-square over several thousand days rejects uniformity for deviations too
+small to matter, so two effect sizes travel with it. <code>ks</code> is the
+Kolmogorov-Smirnov distance from Uniform(0,1); <code>max_bin_dev</code> is the
+largest single-bin departure from the ideal density of 0.05.</p>
+<h3>5.2 Calibration on common days</h3>
+<p><code>gjr_skewt_vt</code> is unavailable at five origins, so the pooled table
+judges the models on different days. Restricted to the {len(common_years)} origins
+every candidate survived, all six are judged on identical days:</p>
+{_html_table(extra["pit_common"])}
+<h3>5.3 Calibration by regime</h3>
+<p>The same diagnostics split by the regime of the test year.</p>
+{_html_table(extra["pit_regime"])}
+<img alt="PIT by regime" src="data:image/png;base64,{encoded['PIT by regime']}">
 <h2>6. Path-rank histograms</h2><p>{sections['6. Path-rank histograms']}</p>
 <img alt="Path-rank histograms" src="data:image/png;base64,{encoded['Path-rank histograms']}">
 <h2>7. Parameter drift</h2><p>{sections['7. Parameter drift']}</p>
 <img alt="Parameter drift" src="data:image/png;base64,{encoded['Parameter drift']}">
+<p>The dotted line in every persistence panel marks 1.0. Above it the variance
+process has no finite unconditional variance.</p>
+<h3>7.1 Persistence by origin</h3>
+{_html_table(extra["persistence_origins"], 5)}
 <h2>8. Diebold-Mariano</h2><p>{sections['8. Diebold-Mariano']}</p>{_html_table(dm)}
 <h2>9. Failure modes</h2><div class="todo">{sections['9. Failure modes']}
 <ul>{''.join(f'<li>{html.escape(line.lstrip("- ").lstrip())}</li>' for line in failure_lines)}</ul></div>

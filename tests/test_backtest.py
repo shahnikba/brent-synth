@@ -442,3 +442,128 @@ def test_persistence_table_flags_the_garch_family(returns: pd.Series) -> None:
     table = persistence_table(params)
     assert list(table["model"]) == ["gjr_skewt"]
     assert float(table["2014"].iloc[0]) > 1.0
+
+
+# --- SPEC 5.2 reporting helpers -------------------------------------------
+
+
+def test_pit_diagnostics_reports_effect_sizes() -> None:
+    """A p-value alone cannot say whether a deviation matters."""
+    from brent_synth.comparison_report import pit_diagnostics
+
+    # A deterministic uniform grid, not a random draw: the chi-square
+    # rejects 5% of genuinely uniform samples, and a seeded draw that
+    # happens to land there would make this test a coin flip. (One does:
+    # default_rng(0).uniform(6000) gives p = 0.040 with a KS distance of
+    # 0.007 — which is the argument for reporting effect sizes at all.)
+    flat = pit_diagnostics((np.arange(6000) + 0.5) / 6000)
+    assert flat["pit_shape"] == "flat"
+    assert flat["ks"] < 0.01
+    assert flat["max_bin_dev"] < 0.01
+
+    # A badly humped sample must show a much larger effect, not just a
+    # smaller p-value.
+    rng = np.random.default_rng(0)
+    humped = pit_diagnostics(np.clip(rng.normal(0.5, 0.1, 6000), 1e-3, 1 - 1e-3))
+    assert humped["pit_shape"].startswith("hump")
+    assert humped["ks"] > 10 * flat["ks"]
+    assert humped["max_bin_dev"] > 10 * flat["max_bin_dev"]
+
+
+def test_a_marginal_p_value_comes_with_a_small_effect() -> None:
+    """The reason effect sizes ship alongside the chi-square.
+
+    A uniform draw that trips the 5% threshold must still show a tiny
+    KS distance, so a reader can tell a real miscalibration from noise.
+    """
+    from brent_synth.comparison_report import pit_diagnostics
+
+    result = pit_diagnostics(np.random.default_rng(0).uniform(size=6000))
+    assert result["chi2_p"] < 0.05  # rejected
+    assert result["ks"] < 0.02  # but the deviation is negligible
+
+    missing = pit_diagnostics(np.array([0.2, 0.5]))
+    assert missing["pit_shape"] == "n/a"
+    assert np.isnan(missing["ks"])
+
+
+def test_max_bin_deviation_is_in_density_units() -> None:
+    """0.02 must mean 'a bin holding 7% where it should hold 5%'."""
+    from brent_synth.comparison_report import PIT_BINS, pit_diagnostics
+
+    # Half the mass crammed into the first bin.
+    values = np.concatenate([np.full(1000, 0.01), np.linspace(0.05, 0.99, 1000)])
+    result = pit_diagnostics(values)
+    assert result["max_bin_dev"] == pytest.approx(0.5 - 1.0 / PIT_BINS, abs=0.02)
+
+
+def test_per_loss_ranks_covers_every_loss_and_period() -> None:
+    from brent_synth.comparison_report import per_loss_ranks
+
+    summary = _mixed_summary()
+    summary = pd.concat(
+        [summary, summary.assign(origin_year=2019), summary.assign(origin_year=2020)]
+    )
+    table = per_loss_ranks(summary, ("best", "mid"))
+    assert len(table) == len(RANKING_LOSSES)
+    for model in ("best", "mid"):
+        for period in ("selection", "confirmation"):
+            assert f"{model} ({period})" in table.columns
+
+
+def test_common_origins_are_those_every_model_survived() -> None:
+    from brent_synth.comparison_report import common_origins
+
+    summary = _mixed_summary()  # 'flaky' fails at 2012 only
+    assert common_origins(summary) == [2011]
+
+
+def test_persistence_by_origin_flags_the_boundary() -> None:
+    from brent_synth.comparison_report import persistence_by_origin
+
+    class Fake:
+        params = pd.DataFrame(
+            [
+                {"model": "gjr_skewt", "origin_year": year, "param": p, "value": v}
+                for year, alpha in ((2014, 0.08), (2015, 0.04))
+                for p, v in (
+                    ("alpha", alpha),
+                    ("beta", 0.93),
+                    ("gamma", 0.02),
+                    ("nu", 6.0),
+                    ("lambda", -0.1),
+                )
+            ]
+        )
+
+    table = persistence_by_origin(Fake()).set_index("origin_year")
+    assert table.loc[2014, "non_stationary"] == "gjr_skewt"
+    assert table.loc[2015, "non_stationary"] == "-"
+    assert "gjr nu" in table.columns and "gjr gamma" in table.columns
+
+
+def test_stress_losses_always_include_the_covid_origin(returns: pd.Series) -> None:
+    """Origin 2019's test window is calendar 2020; it must never drop out."""
+    from brent_synth.comparison_report import stress_origin_losses
+
+    class Fake:
+        summary = pd.DataFrame(
+            [
+                {
+                    "origin_year": year,
+                    "regime": "calm",  # deliberately not labelled stress
+                    "model": "m",
+                    "status": "ok",
+                    "rank_max_drawdown": 0.5,
+                    "rank_worst_day": 0.5,
+                    **{loss: 1.0 for loss in RANKING_LOSSES},
+                }
+                for year in (2013, 2019)
+            ]
+        )
+
+    table = stress_origin_losses(Fake())
+    assert 2019 in set(table["origin_year"])
+    assert 2013 not in set(table["origin_year"])
+    for loss in RANKING_LOSSES:
+        assert loss in table.columns
