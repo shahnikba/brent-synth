@@ -15,12 +15,14 @@ from statsmodels.tsa.stattools import acf
 from brent_synth.model import ModelFit, _leverage_weight, simulate
 from brent_synth.validation import (
     DISPERSION_BOUNDS,
+    FIGURE_SLUGS,
     DUPLICATE_STATS,
     INDEPENDENT_STATS,
     STAT_NAMES,
     bootstrap_bands,
     compute_path_stats,
     compute_stats,
+    make_markdown_report,
     make_report,
     run_validation,
     validate,
@@ -491,3 +493,119 @@ def test_report_labels_persistence_with_the_current_formula(
     assert "γ/2" not in text
     assert "leverage weight" in text
     assert "Spread" in text  # dispersion column is surfaced
+
+
+# --- markdown report -------------------------------------------------------
+
+
+def _markdown_kwargs(bands: dict) -> dict:
+    return {
+        "seed": 42,
+        "n_boot": N_BOOT,
+        "boot_drawdowns": bands["max_drawdown"][3],
+    }
+
+
+def test_markdown_report_is_written_with_its_figures(
+    market: pd.Series, synth: np.ndarray, bands: dict, tmp_path
+) -> None:
+    results = validate(synth, market, bands=bands)
+    out = tmp_path / "validation.md"
+    path = make_markdown_report(
+        market, _known_fit(), synth, results, out_path=str(out),
+        **_markdown_kwargs(bands),
+    )
+    assert path == str(out)
+
+    figure_dir = tmp_path / "validation_figures"
+    written = sorted(p.name for p in figure_dir.iterdir())
+    assert written == sorted(f"{slug}.png" for slug in FIGURE_SLUGS.values())
+    assert all((figure_dir / name).stat().st_size > 1000 for name in written)
+
+    text = out.read_text(encoding="utf-8")
+    for name in written:
+        assert f"(validation_figures/{name})" in text  # relative, resolvable
+    assert "http://" not in text and "https://" not in text
+
+
+def test_markdown_report_carries_the_same_content_as_the_html(
+    market: pd.Series, synth: np.ndarray, bands: dict, tmp_path
+) -> None:
+    """The two formats must not tell different stories."""
+    results = validate(synth, market, bands=bands)
+    md = tmp_path / "v.md"
+    html_out = tmp_path / "v.html"
+    make_markdown_report(
+        market, _known_fit(), synth, results, out_path=str(md),
+        **_markdown_kwargs(bands),
+    )
+    make_report(
+        market, _known_fit(), synth, results, out_path=str(html_out),
+        **_markdown_kwargs(bands),
+    )
+    text = md.read_text(encoding="utf-8")
+
+    n_pass = int(results.loc[results["independent"], "passed"].sum())
+    n_total = int(results["independent"].sum())
+    assert f"**{n_pass} of {n_total}**" in text
+    assert f"<b>{n_pass} of {n_total}</b>" in html_out.read_text(encoding="utf-8")
+
+    for label in ("Excess kurtosis", "Max drawdown (median)", "ACF of r², lag 10"):
+        assert label in text
+    assert "Failure modes" in text and "TODO" in text
+    assert "γ/2" not in text
+    assert "leverage weight" in text
+    assert text.count("| PASS |") + text.count("| **FAIL** |") == len(STAT_NAMES)
+
+
+def test_markdown_report_is_byte_identical_across_runs(
+    market: pd.Series, synth: np.ndarray, bands: dict, tmp_path
+) -> None:
+    results = validate(synth, market, bands=bands)
+    out = tmp_path / "validation.md"
+    figure = tmp_path / "validation_figures" / "qq-plot.png"
+
+    # Same path twice: the figure directory is named after the document,
+    # so writing to two different names would differ by design.
+    make_markdown_report(
+        market, _known_fit(), synth, results, out_path=str(out),
+        **_markdown_kwargs(bands),
+    )
+    first, first_png = out.read_bytes(), figure.read_bytes()
+
+    make_markdown_report(
+        market, _known_fit(), synth, results, out_path=str(out),
+        **_markdown_kwargs(bands),
+    )
+    assert out.read_bytes() == first
+    assert figure.read_bytes() == first_png  # plots reproduce too
+
+
+def test_run_validation_writes_both_formats(tmp_path) -> None:
+    html_out = tmp_path / "pipeline.html"
+    md_out = tmp_path / "pipeline.md"
+    run_validation(
+        seed=42,
+        horizon=60,
+        n_paths=150,
+        n_boot=150,
+        out_path=str(html_out),
+        markdown_path=str(md_out),
+    )
+    assert html_out.exists() and md_out.exists()
+    assert (tmp_path / "pipeline_figures").is_dir()
+    assert "# Brent synthetic-path validation" in md_out.read_text(encoding="utf-8")
+
+
+def test_markdown_can_be_skipped(tmp_path) -> None:
+    html_out = tmp_path / "only.html"
+    run_validation(
+        seed=42,
+        horizon=60,
+        n_paths=150,
+        n_boot=150,
+        out_path=str(html_out),
+        markdown_path=None,
+    )
+    assert html_out.exists()
+    assert not list(tmp_path.glob("*.md"))

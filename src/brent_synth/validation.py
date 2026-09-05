@@ -431,17 +431,17 @@ def validate(
 # --- report ----------------------------------------------------------------
 
 
-def _figure_to_base64(figure: plt.Figure) -> str:
-    """PNG bytes as base64. Metadata is stripped so runs are byte-identical."""
+def _figure_to_png(figure: plt.Figure) -> bytes:
+    """Render to PNG bytes. Metadata is stripped so runs are byte-identical."""
     buffer = io.BytesIO()
     figure.savefig(
         buffer, format="png", dpi=110, bbox_inches="tight", metadata={"Software": None}
     )
     plt.close(figure)
-    return base64.b64encode(buffer.getvalue()).decode("ascii")
+    return buffer.getvalue()
 
 
-def _plot_histogram(real: np.ndarray, synthetic: np.ndarray) -> str:
+def _plot_histogram(real: np.ndarray, synthetic: np.ndarray) -> bytes:
     figure, axes = plt.subplots(figsize=(7.5, 4.2))
     edges = np.linspace(
         min(real.min(), np.quantile(synthetic, 0.0005)),
@@ -457,10 +457,10 @@ def _plot_histogram(real: np.ndarray, synthetic: np.ndarray) -> str:
     axes.set_ylabel("Density (log scale)")
     axes.set_title("Return distribution — log density exposes the tails")
     axes.legend()
-    return _figure_to_base64(figure)
+    return _figure_to_png(figure)
 
 
-def _plot_qq(real: np.ndarray, synthetic: np.ndarray) -> str:
+def _plot_qq(real: np.ndarray, synthetic: np.ndarray) -> bytes:
     probabilities = np.linspace(0.001, 0.999, 400)
     real_q = np.quantile(real, probabilities)
     synth_q = np.quantile(synthetic, probabilities)
@@ -472,10 +472,10 @@ def _plot_qq(real: np.ndarray, synthetic: np.ndarray) -> str:
     axes.set_ylabel("Synthetic quantile")
     axes.set_title("QQ: synthetic vs real")
     axes.set_aspect("equal", adjustable="box")
-    return _figure_to_base64(figure)
+    return _figure_to_png(figure)
 
 
-def _plot_acf(real: np.ndarray, paths: np.ndarray, nlags: int = 40) -> str:
+def _plot_acf(real: np.ndarray, paths: np.ndarray, nlags: int = 40) -> bytes:
     real_acf = acf(real**2, nlags=nlags, fft=True)
     per_path = np.array([acf(p**2, nlags=nlags, fft=True) for p in paths[:400]])
     mean_acf = per_path.mean(axis=0)
@@ -489,10 +489,10 @@ def _plot_acf(real: np.ndarray, paths: np.ndarray, nlags: int = 40) -> str:
     axes.set_ylabel("ACF of squared returns")
     axes.set_title("Volatility clustering: decay of ACF(r²)")
     axes.legend()
-    return _figure_to_base64(figure)
+    return _figure_to_png(figure)
 
 
-def _plot_fan(real: np.ndarray, paths: np.ndarray) -> str:
+def _plot_fan(real: np.ndarray, paths: np.ndarray) -> bytes:
     """Recent real path spliced to synthetic cones, both indexed to 100.
 
     The level is normalised rather than taken from actual Brent prices
@@ -528,10 +528,10 @@ def _plot_fan(real: np.ndarray, paths: np.ndarray) -> str:
     axes.set_ylabel("Index (today = 100)")
     axes.set_title("Fan chart: simulated paths continuing from today's vol state")
     axes.legend(fontsize=8)
-    return _figure_to_base64(figure)
+    return _figure_to_png(figure)
 
 
-def _plot_drawdown(boot_drawdowns: np.ndarray, paths: np.ndarray) -> str:
+def _plot_drawdown(boot_drawdowns: np.ndarray, paths: np.ndarray) -> bytes:
     synthetic = _max_drawdown(paths)
     figure, axes = plt.subplots(figsize=(7.5, 4.0))
     edges = np.linspace(
@@ -553,7 +553,64 @@ def _plot_drawdown(boot_drawdowns: np.ndarray, paths: np.ndarray) -> str:
     axes.set_ylabel("Density")
     axes.set_title("Drawdown distribution")
     axes.legend(fontsize=8)
-    return _figure_to_base64(figure)
+    return _figure_to_png(figure)
+
+
+FIGURE_SLUGS = {
+    "Return distribution": "return-distribution",
+    "QQ plot": "qq-plot",
+    "ACF of squared returns": "acf-squared-returns",
+    "Fan chart": "fan-chart",
+    "Drawdown distribution": "drawdown-distribution",
+}
+
+
+def _prepare(
+    returns: pd.Series,
+    synth_paths: np.ndarray,
+    boot_drawdowns: np.ndarray | None,
+    n_boot: int,
+    block: int,
+    boot_seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Shared setup for both report formats."""
+    real = np.asarray(returns, dtype="float64").ravel()
+    real = real[np.isfinite(real)]
+    paths = _as_paths(synth_paths)
+
+    if boot_drawdowns is None:
+        bands = bootstrap_bands(
+            returns,
+            horizon=paths.shape[1],
+            n_boot=n_boot,
+            block=block,
+            seed=boot_seed,
+        )
+        boot_drawdowns = bands["max_drawdown"][3]
+    return real, paths, boot_drawdowns
+
+
+def _build_figures(
+    real: np.ndarray, paths: np.ndarray, boot_drawdowns: np.ndarray
+) -> list[tuple[str, bytes]]:
+    """The five required plots, as (title, PNG bytes)."""
+    pooled = paths.ravel()
+    return [
+        ("Return distribution", _plot_histogram(real, pooled)),
+        ("QQ plot", _plot_qq(real, pooled)),
+        ("ACF of squared returns", _plot_acf(real, paths)),
+        ("Fan chart", _plot_fan(real, paths)),
+        ("Drawdown distribution", _plot_drawdown(boot_drawdowns, paths)),
+    ]
+
+
+def _summary_counts(results_df: pd.DataFrame) -> tuple[int, int, int]:
+    independent = results_df.loc[results_df["independent"]]
+    return (
+        int(independent["passed"].sum()),
+        len(independent),
+        int((~independent["dispersion_passed"]).sum()),
+    )
 
 
 def _results_table_html(results: pd.DataFrame) -> str:
@@ -607,33 +664,13 @@ def make_report(
     byte-identical across runs at fixed seeds, and a clock would break
     that.
     """
-    real = np.asarray(returns, dtype="float64").ravel()
-    real = real[np.isfinite(real)]
-    paths = _as_paths(synth_paths)
-    pooled = paths.ravel()
-
-    if boot_drawdowns is None:
-        bands = bootstrap_bands(
-            returns,
-            horizon=paths.shape[1],
-            n_boot=n_boot,
-            block=block,
-            seed=boot_seed,
-        )
-        boot_drawdowns = bands["max_drawdown"][3]
-
-    figures = [
-        ("Return distribution", _plot_histogram(real, pooled)),
-        ("QQ plot", _plot_qq(real, pooled)),
-        ("ACF of squared returns", _plot_acf(real, paths)),
-        ("Fan chart", _plot_fan(real, paths)),
-        ("Drawdown distribution", _plot_drawdown(boot_drawdowns, paths)),
-    ]
+    real, paths, boot_drawdowns = _prepare(
+        returns, synth_paths, boot_drawdowns, n_boot, block, boot_seed
+    )
+    figures = _build_figures(real, paths, boot_drawdowns)
 
     independent = results_df.loc[results_df["independent"]]
-    n_pass = int(independent["passed"].sum())
-    n_total = len(independent)
-    n_wide = int((~independent["dispersion_passed"]).sum())
+    n_pass, n_total, n_wide = _summary_counts(results_df)
     failures = results_df.loc[~results_df["passed"] & results_df["independent"]]
     wide = independent.loc[~independent["dispersion_passed"]]
 
@@ -668,7 +705,7 @@ def make_report(
 
     figure_blocks = "".join(
         f"<figure><img alt='{html.escape(title)}' "
-        f"src='data:image/png;base64,{payload}'>"
+        f"src='data:image/png;base64,{base64.b64encode(payload).decode('ascii')}'>"
         f"<figcaption>{html.escape(title)}</figcaption></figure>"
         for title, payload in figures
     )
@@ -759,6 +796,181 @@ material work in the width of these bands.</i></p>
     return str(destination)
 
 
+
+def _markdown_table(results: pd.DataFrame) -> str:
+    header = (
+        "| Statistic | Synthetic median | Synthetic 2.5-97.5% | Real 2.5% | "
+        "Real median | Real 97.5% | Position | Spread | Result |\n"
+        "|---|---:|---:|---:|---:|---:|---:|---:|:--|"
+    )
+    lines = [header]
+    for row in results.itertuples():
+        verdict = "PASS" if row.passed else "**FAIL**"
+        spread = (
+            "n/a"
+            if not np.isfinite(row.dispersion_ratio)
+            else f"{row.dispersion_ratio:.2f}x"
+        )
+        if not row.dispersion_passed and np.isfinite(row.dispersion_ratio):
+            spread = f"**{spread}**"
+        label = row.label
+        if not row.independent:
+            label += f" *(= -{STAT_LABELS[DUPLICATE_STATS[row.statistic]]})*"
+        lines.append(
+            f"| {label} | {row.synthetic:.5f} | "
+            f"{row.synth_lo:.5f} to {row.synth_hi:.5f} | {row.boot_lo:.5f} | "
+            f"{row.boot_median:.5f} | {row.boot_hi:.5f} | {row.position:+.2f} | "
+            f"{spread} | {verdict} |"
+        )
+    return "\n".join(lines)
+
+
+def make_markdown_report(
+    returns: pd.Series,
+    fit: ModelFit,
+    synth_paths: np.ndarray,
+    results_df: pd.DataFrame,
+    out_path: str = "reports/validation.md",
+    seed: int | None = None,
+    block: int = DEFAULT_BLOCK,
+    n_boot: int = DEFAULT_N_BOOT,
+    boot_seed: int = 7,
+    boot_drawdowns: np.ndarray | None = None,
+) -> str:
+    """Markdown twin of :func:`make_report`. Returns the path.
+
+    Same content and same section order as the HTML, so the two cannot
+    tell different stories. Markdown has no portable way to inline an
+    image, so the five plots are written as PNG files beside the
+    document — into ``<stem>_figures/`` — and linked relatively. That
+    keeps the report readable anywhere markdown renders, at the cost of
+    it being a directory rather than one file.
+
+    Carries no timestamp, for the same reason the HTML does not: fixed
+    seeds must give a reproducible document.
+    """
+    real, paths, boot_drawdowns = _prepare(
+        returns, synth_paths, boot_drawdowns, n_boot, block, boot_seed
+    )
+    figures = _build_figures(real, paths, boot_drawdowns)
+
+    independent = results_df.loc[results_df["independent"]]
+    n_pass, n_total, n_wide = _summary_counts(results_df)
+    failures = results_df.loc[~results_df["passed"] & results_df["independent"]]
+    wide = independent.loc[~independent["dispersion_passed"]]
+
+    destination = Path(out_path)
+    figure_dir = destination.parent / f"{destination.stem}_figures"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+
+    figure_lines = []
+    for title, payload in figures:
+        filename = f"{FIGURE_SLUGS[title]}.png"
+        (figure_dir / filename).write_bytes(payload)
+        figure_lines.append(
+            f"### {title}\n\n![{title}]({figure_dir.name}/{filename})"
+        )
+
+    params_rows = "\n".join(
+        f"| {name} | {value:.6g} |" for name, value in fit.params.items()
+    )
+
+    if len(failures):
+        failure_lines = "\n".join(
+            f"- **{row.label}** — synthetic {row.synthetic:.5f} vs real band "
+            f"[{row.boot_lo:.5f}, {row.boot_hi:.5f}], "
+            f"{abs(row.position):.2f} band-widths "
+            f"{'below' if row.position < 0 else 'above'}. "
+            "*TODO: explain why the model does this.*"
+            for row in failures.itertuples()
+        )
+    else:
+        failure_lines = (
+            "- No statistic fell outside its band. *TODO: say whether that is "
+            "genuine agreement or a band wide enough to hide a problem.*"
+        )
+
+    if len(wide):
+        wide_lines = "\n".join(
+            f"- **{row.label}** — synthetic paths span {row.synth_lo:.5f} to "
+            f"{row.synth_hi:.5f}, {row.dispersion_ratio:.2f}x the real band "
+            f"[{row.boot_lo:.5f}, {row.boot_hi:.5f}]. "
+            "*TODO: is this over- or under-dispersion the model's doing?*"
+            for row in wide.itertuples()
+        )
+    else:
+        wide_lines = "- Every statistic's spread sits within the bounds."
+
+    seed_text = "not recorded" if seed is None else str(seed)
+    low, high = DISPERSION_BOUNDS
+    document = f"""# Brent synthetic-path validation
+
+**{n_pass} of {n_total}** independent statistics fall inside the real bootstrap
+band, and **{n_wide}** show a spread outside {low:g}-{high:g}x the real one.
+
+Synthetic paths come from GJR-GARCH(1,1,1) with skewed-t innovations; the
+acceptance band is a stationary block bootstrap of the real returns at the same
+horizon. Every statistic is measured per path on {paths.shape[1]} days, on both
+sides. VaR rows are the signed tail quantiles under another name and are
+excluded from the count above.
+
+## 1. Run configuration
+
+| Setting | Value |
+|---|---:|
+| Real observations | {real.size} |
+| Horizon (days) | {paths.shape[1]} |
+| Synthetic paths | {paths.shape[0]} |
+| Bootstrap replicates | {n_boot} |
+| Bootstrap block (expected days) | {block} |
+| Simulation seed | {seed_text} |
+| Bootstrap seed | {boot_seed} |
+{params_rows}
+| persistence (a + g*E[z^2 1{{z<0}}] + b) | {fit.persistence:.6f} |
+| leverage weight E[z^2 1{{z<0}}] | {fit.leverage_weight:.6f} |
+| forecast variance sigma^2(T+1) | {fit.forecast_variance:.6g} |
+| unconditional variance | {fit.unconditional_variance:.6g} |
+
+## 2. Acceptance table
+
+A statistic PASSES when the synthetic median lies inside the real 2.5-97.5%
+bootstrap band. `Position` is 0 inside the band, and otherwise counts
+band-widths beyond the breached bound (negative below, positive above).
+`Spread` is the synthetic 2.5-97.5% width over the real one: a model can sit on
+the median and still be far too variable, and only this column sees that. VaR
+and ES are positive loss magnitudes; the percentile rows are signed returns.
+Rows marked *(= -...)* are the same number as another row, reported under both
+conventional names and counted once.
+
+{_markdown_table(results_df)}
+
+## 3. Plots
+
+{chr(10).join(chr(10).join([line, ""]) for line in figure_lines)}
+
+## 4. Failure modes
+
+> **TODO — narrative to be written.** The numbers below are pre-filled; the
+> interpretation is not.
+
+**Outside the band ({len(failures)}):**
+
+{failure_lines}
+
+**Spread mismatches ({n_wide}):**
+
+{wide_lines}
+
+*TODO: state whether the ACF decay mismatch is acceptable for the intended use,
+and whether the block length of {block} days is doing material work in the width
+of these bands.*
+"""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(document, encoding="utf-8")
+    return str(destination)
+
+
 def run_validation(
     seed: int = 42,
     horizon: int = DEFAULT_HORIZON,
@@ -767,9 +979,13 @@ def run_validation(
     block: int = DEFAULT_BLOCK,
     boot_seed: int = 7,
     out_path: str = "reports/validation.html",
+    markdown_path: str | None = "reports/validation.md",
 ) -> str:
     """load returns → fit → simulate → bootstrap → validate → report.
     One call. Returns report path.
+
+    Writes the HTML report and, unless ``markdown_path`` is None, a
+    markdown twin of it beside the plots.
     """
     returns = load_returns()
     fitted = fit_model(returns)
@@ -782,15 +998,18 @@ def run_validation(
     # Reuse the bootstrap just computed rather than running an identical
     # one inside validate(); it is the dominant cost of this pipeline.
     results = validate(paths, returns, bands=bands)
-    return make_report(
-        returns,
-        fitted,
-        paths,
-        results,
-        out_path=out_path,
-        seed=seed,
-        block=block,
-        n_boot=n_boot,
-        boot_seed=boot_seed,
-        boot_drawdowns=bands["max_drawdown"][3],
+    shared = {
+        "seed": seed,
+        "block": block,
+        "n_boot": n_boot,
+        "boot_seed": boot_seed,
+        "boot_drawdowns": bands["max_drawdown"][3],
+    }
+    report_path = make_report(
+        returns, fitted, paths, results, out_path=out_path, **shared
     )
+    if markdown_path is not None:
+        make_markdown_report(
+            returns, fitted, paths, results, out_path=markdown_path, **shared
+        )
+    return report_path
