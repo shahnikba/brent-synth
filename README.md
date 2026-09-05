@@ -1,47 +1,165 @@
 # brent-synth
 
-Brent crude research project. This stage covers the data layer only:
-fetch daily Brent close prices, clean them, cache them, and return log
-returns. Modelling and validation come later.
+A synthetic scenario generator for Brent crude daily returns: diagnose
+the series, fit one generative model, and validate what it produces
+against what the market actually did — in sample, and out of time at
+fourteen year-end origins under a ranking rule fixed before the first
+result existed.
 
-## Requirements
+*Data ingestion is the only component the brief said to take as given;
+everything below it was built here.*
 
-- Python 3.11
-- [`uv`](https://docs.astral.sh/uv/)
+---
 
-## Setup
+## 1. Statistical diagnostics
+
+Moments, autocorrelation of returns and of squared returns, and three
+tail diagnostics (Hill, peaks-over-threshold GPD, mean-excess), with the
+prose interpretation that drives the model choice.
+
+- [docs/narrative/diagnostics.md](docs/narrative/diagnostics.md) — the
+  interpretation
+- [src/brent_synth/diagnostics.py](src/brent_synth/diagnostics.py) — the
+  computation (no plotting; `run_all()` returns one nested dict)
+
+Headline: no linear structure in the mean (ACF −0.019 at lag 1), strong
+and slowly-decaying structure in the variance (ACF of r² 0.204 at lag 1,
+still 0.097 at lag 40, Ljung–Box p ≈ 1.9e−213), excess kurtosis 11.7,
+skew −0.78, and a loss tail materially heavier than the gain tail
+(GPD ξ 0.212 vs 0.127).
+
+## 2. Generative model
+
+GJR-GARCH(1,1,1) with standardised skewed-t innovations. Fit-then-simulate,
+fixed seed, raw log-return units at every public boundary.
+
+- [src/brent_synth/model.py](src/brent_synth/model.py) — `fit`,
+  `simulate`, `fit_and_simulate`
+- **What it reproduces and what it does not**:
+  [reports/validation.md](reports/validation.md) §0 (source:
+  [docs/narrative/validation_scope.md](docs/narrative/validation_scope.md))
+
+The champion was not assumed. It was selected out of time from a ladder
+of six candidates in [src/brent_synth/candidates/](src/brent_synth/candidates/)
+— iid-t, GARCH-normal, GJR-skewt, variance-targeted GJR, FIGARCH-skewt,
+and a two-regime Markov-switching variance — under the plan in
+[docs/preregistration.md](docs/preregistration.md). See
+[reports/model_comparison.md](reports/model_comparison.md).
+
+## 3. Validation
+
+Synthetic against real on moments, tail quantiles, VaR/ES at 95 and 99,
+autocorrelation of squared returns, and maximum drawdown; thresholds are
+the real data's own bootstrap sampling bands rather than hand-set
+tolerances.
+
+- [reports/validation.md](reports/validation.md) — in-sample check on the
+  champion, five plots ([.html twin](reports/validation.html))
+- [reports/model_comparison.md](reports/model_comparison.md) —
+  out-of-time comparison, four figures ([.html twin](reports/model_comparison.html))
+- [src/brent_synth/validation.py](src/brent_synth/validation.py) —
+  bootstrap bands, acceptance test, report generation
+- [src/brent_synth/backtest.py](src/brent_synth/backtest.py) — origins,
+  scoring, ranking, pre-registration
+
+Both reports are **generated artefacts**, written by the commands under
+"How to run" below. `reports/` is gitignored along with `data/`, so the
+two links above resolve once you have run the pipeline, not on a fresh
+clone. The prose they inline is committed, in
+[docs/narrative/](docs/narrative/).
+
+Failure modes are stated, not buried: every independent statistic passes
+the location test and five fail the dispersion test, and one mechanism —
+a near-integrated variance approximating long memory — accounts for all
+of them. See validation.md §4 and model_comparison.md §9.
+
+## 4. AI-assisted development
+
+- [AIUSAGE.md](AIUSAGE.md)
+- [docs/specs/](docs/specs/) — every spec and implementer report,
+  numbered in the order written
+
+## 5. AWS deployment design
+
+- [aws_deployment.md](aws_deployment.md)
+
+---
+
+## How to run
+
+Requires Python 3.11 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync --extra dev
 ```
 
-## Usage
+Generate the in-sample validation report (`reports/validation.md`,
+`.html`, and its figures):
 
-```python
-from brent_synth.data import load_prices, load_returns
-
-prices = load_prices()    # pd.Series, name="close", DatetimeIndex
-returns = load_returns()  # pd.Series, name="log_return", DatetimeIndex
+```bash
+uv run python -c "from brent_synth.validation import run_validation; run_validation()"
 ```
 
-Both return a pandas Series with a sorted, unique `DatetimeIndex`.
-Returns are `r_t = ln(P_t) - ln(P_{t-1})` with the leading NaN dropped.
+Run the out-of-time comparison. `preregister` writes the scoring plan and
+its hash; `run` refuses to start unless the committed plan matches:
 
-Pass `refresh=True` to bypass the cache and re-download.
+```bash
+uv run python -m brent_synth.backtest preregister
+uv run python -m brent_synth.backtest run
+uv run python -m brent_synth.backtest report
+```
 
-## Data
-
-Source is Yahoo Finance ticker `BZ=F` (ICE Brent front-month future),
-fetched with `period="max"`. The raw closes are cached to
-`data/brent_raw.parquet` on first use and reloaded from there
-afterwards.
-
-`data/` is gitignored. No data is ever committed.
-
-## Tests
+Tests:
 
 ```bash
 uv run pytest
 ```
 
-The tests hit the cache if it is warm, and the network otherwise.
+### Expected runtimes
+
+Measured on an Intel MacBook Pro, warm price cache.
+
+| Step | Time |
+|---|---|
+| `run_validation()` | ~9 s |
+| `backtest run` — cold, 84 (model, origin) pairs | ~2 min 50 s |
+| `backtest run` — warm from cache | ~2 s |
+| `backtest report` | ~10 s |
+| `pytest` (218 tests) | ~36 s |
+
+The first call of any kind downloads ~19 years of daily prices; allow a
+few extra seconds.
+
+## Reproducibility
+
+- **Seeds.** Simulation seed 42 (validation) and 2024 (backtest);
+  bootstrap seed 7. Every simulator draws from an explicit
+  `default_rng(seed)`, so the same seed gives byte-identical arrays.
+- **Pre-registration.** The scoring plan is hashed into
+  [docs/preregistration.md](docs/preregistration.md)
+  (`sha256:15aa66f0…`); `run_backtest` recomputes the hash from the live
+  constants and refuses to run if they have drifted. Amendment 1 is
+  recorded post hoc in the same file with its reason.
+- **Tags.** `spec5-preregistered` marks the pre-registration commit,
+  `spec5-run` the results commit. Git cannot prove the ordering of
+  commits made in one session and no such claim is made.
+- **Byte-identical reports.** Neither report carries a timestamp and PNG
+  metadata is stripped, so regenerating at fixed seeds reproduces the
+  documents and their figures byte for byte.
+- **Cache.** Per-(model, origin) backtest results are cached under
+  `reports/backtest_cache/`, keyed by the pre-registration hash — change
+  the plan and the cache is invalidated rather than silently mixed.
+
+## Data
+
+Daily Brent front-month futures (Yahoo Finance `BZ=F`), fetched in code
+by [src/brent_synth/data.py](src/brent_synth/data.py) and cached to
+`data/brent_raw.parquet`. **No data is committed**: `data/`, `*.parquet`,
+`*.csv` and `reports/` are all gitignored.
+
+The cache is stamped with its fetch date and trusted only for that day,
+so a stale series is never served silently; a failed refresh falls back
+to the cached data with a warning rather than raising. Yahoo's
+provisional final bar — the live quote published as a complete daily row,
+identifiable by a volume copied from the previous day — is detected and
+dropped, so an intraday tick is never cached as a settlement.
