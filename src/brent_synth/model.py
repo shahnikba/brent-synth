@@ -49,7 +49,15 @@ PARAM_NAMES = ("mu", "omega", "alpha", "gamma", "beta", "nu", "lambda")
 class ModelFit:
     """A fitted GJR-GARCH(1,1,1)-skewt, with enough state to simulate.
 
-    ``params`` and both variances are in raw log-return units.
+    ``params`` and every variance are in raw log-return units.
+
+    Two starting variances are carried, and they are not the same
+    thing. ``last_variance`` is sigma_T^2, the conditional variance
+    *of* the final observed day. ``forecast_variance`` is
+    sigma_{T+1}^2, one GJR recursion step further on, formed from the
+    final observed shock — that is the variance tomorrow opens at, and
+    it is what :func:`simulate` starts from under
+    ``initial_var='last'``.
     ``loglik``, ``aic`` and ``bic`` are reported on the percent scale
     the optimiser actually worked on, so they compare across models
     fitted through this module but not against raw-scale likelihoods.
@@ -60,6 +68,7 @@ class ModelFit:
     aic: float
     bic: float
     last_variance: float
+    forecast_variance: float
     unconditional_variance: float
     result: Any | None = field(default=None, repr=False)
 
@@ -122,12 +131,22 @@ def fit(returns: pd.Series) -> ModelFit:
 
     last_variance = float(result.conditional_volatility[-1] ** 2) / PERCENT**2
 
+    # One GJR step past the sample: tomorrow's conditional variance,
+    # built from the final observed shock. Done in raw units so it needs
+    # no rescaling of its own.
+    last_shock = float(values[-1]) - params["mu"]
+    leverage = params["alpha"] + params["gamma"] * (last_shock < 0.0)
+    forecast_variance = (
+        params["omega"] + leverage * last_shock**2 + params["beta"] * last_variance
+    )
+
     return ModelFit(
         params=params,
         loglik=float(result.loglikelihood),
         aic=float(result.aic),
         bic=float(result.bic),
         last_variance=last_variance,
+        forecast_variance=float(forecast_variance),
         unconditional_variance=float(unconditional),
         result=result,
     )
@@ -135,7 +154,7 @@ def fit(returns: pd.Series) -> ModelFit:
 
 def _initial_variance(fit: ModelFit, initial_var: str) -> float:
     if initial_var == "last":
-        return fit.last_variance
+        return fit.forecast_variance
     if initial_var == "unconditional":
         variance = fit.unconditional_variance
         if not np.isfinite(variance):
@@ -159,9 +178,18 @@ def simulate(
     """Simulate returns. Returns array shape (n_paths, horizon) in raw
     log-return units.
 
-    ``initial_var``: 'last' (start from last fitted conditional
-    variance — paths continue from today's vol state) or
-    'unconditional' (start from stationary variance).
+    ``initial_var`` picks the variance day 1 opens at:
+
+    - ``'last'`` — the one-step-ahead forecast sigma_{T+1}^2, i.e. one
+      GJR recursion step applied to the last observed shock. Paths
+      continue from today's vol state, which is what you want when the
+      question is "what happens next". Note this is deliberately *not*
+      sigma_T^2, the variance of the final observed day; carrying that
+      forward would replay the last day instead of moving past it.
+    - ``'unconditional'`` — the stationary variance
+      omega / (1 - alpha - gamma/2 - beta). Paths start from the
+      long-run vol level, ignoring where the market happens to sit
+      today.
 
     The GJR recursion is path-dependent, so it is stepped through time
     with all ``n_paths`` advanced together at each step. Innovations

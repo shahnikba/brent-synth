@@ -85,7 +85,20 @@ def test_fit_reports_information_criteria(fitted: ModelFit) -> None:
 
 def test_variances_are_positive(fitted: ModelFit) -> None:
     assert fitted.last_variance > 0.0
+    assert fitted.forecast_variance > 0.0
     assert fitted.unconditional_variance > 0.0
+
+
+def test_forecast_variance_is_one_step_past_the_sample(
+    fitted: ModelFit, returns: pd.Series
+) -> None:
+    """sigma_{T+1}^2 must be the GJR recursion applied to the last shock."""
+    p = fitted.params
+    shock = float(returns.iloc[-1]) - p["mu"]
+    leverage = p["alpha"] + p["gamma"] * (shock < 0.0)
+    expected = p["omega"] + leverage * shock**2 + p["beta"] * fitted.last_variance
+    assert fitted.forecast_variance == pytest.approx(expected)
+    assert fitted.forecast_variance != fitted.last_variance
 
 
 def test_fit_rejects_short_series() -> None:
@@ -131,13 +144,24 @@ def test_initial_var_flag_is_wired(fitted: ModelFit) -> None:
 
     Holding the seed fixed, the innovations are identical, so any
     difference on day 1 comes from the starting variance alone.
+    'last' means the one-step-ahead forecast sigma_{T+1}^2, so the
+    day-1 spread must track that rather than sigma_T^2.
     """
-    assert fitted.last_variance != fitted.unconditional_variance
+    assert fitted.forecast_variance != fitted.unconditional_variance
     day_one_last = simulate(fitted, horizon=1, n_paths=500, seed=9, initial_var="last")
     day_one_uncond = simulate(
         fitted, horizon=1, n_paths=500, seed=9, initial_var="unconditional"
     )
     assert not np.allclose(day_one_last, day_one_uncond)
+
+    # Day-1 dispersion must scale as sqrt(forecast variance), not sqrt(sigma_T^2).
+    centred_last = day_one_last - fitted.params["mu"]
+    centred_uncond = day_one_uncond - fitted.params["mu"]
+    observed = float(np.std(centred_last) / np.std(centred_uncond))
+    expected = float(
+        np.sqrt(fitted.forecast_variance / fitted.unconditional_variance)
+    )
+    assert observed == pytest.approx(expected, rel=1e-9)
 
 
 def test_simulate_rejects_bad_arguments(fitted: ModelFit) -> None:
@@ -176,6 +200,7 @@ def test_fit_recovers_known_parameters() -> None:
         aic=0.0,
         bic=0.0,
         last_variance=unconditional,
+        forecast_variance=unconditional,
         unconditional_variance=unconditional,
     )
 

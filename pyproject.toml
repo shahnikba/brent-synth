@@ -12,6 +12,7 @@ dependencies = [
     "scipy>=1.17.1",
     "statsmodels>=0.15.0",
     "arch==8.0.0",
+    "matplotlib>=3.11.1",
 ]
 
 [project.optional-dependencies]
