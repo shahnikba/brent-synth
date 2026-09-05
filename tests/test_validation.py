@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from brent_synth.model import ModelFit, simulate
+from brent_synth.model import ModelFit, _leverage_weight, simulate
 from brent_synth.validation import (
     STAT_NAMES,
     bootstrap_bands,
@@ -37,7 +37,10 @@ TRUE_PARAMS = {
 
 def _known_fit() -> ModelFit:
     persistence = (
-        TRUE_PARAMS["alpha"] + TRUE_PARAMS["gamma"] / 2.0 + TRUE_PARAMS["beta"]
+        TRUE_PARAMS["alpha"]
+        + TRUE_PARAMS["gamma"]
+        * _leverage_weight(TRUE_PARAMS["nu"], TRUE_PARAMS["lambda"])
+        + TRUE_PARAMS["beta"]
     )
     unconditional = TRUE_PARAMS["omega"] / (1.0 - persistence)
     return ModelFit(

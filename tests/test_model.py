@@ -11,7 +11,13 @@ import pandas as pd
 import pytest
 
 from brent_synth.data import load_returns
-from brent_synth.model import ModelFit, fit, fit_and_simulate, simulate
+from brent_synth.model import (
+    ModelFit,
+    _leverage_weight,
+    fit,
+    fit_and_simulate,
+    simulate,
+)
 
 TRUE_PARAMS = {
     "mu": 0.0005,
@@ -190,8 +196,9 @@ def test_fit_recovers_known_parameters() -> None:
     diagnostics: it proves fit and simulate agree with each other,
     rather than merely that each one runs.
     """
+    weight = _leverage_weight(TRUE_PARAMS["nu"], TRUE_PARAMS["lambda"])
     persistence = (
-        TRUE_PARAMS["alpha"] + TRUE_PARAMS["gamma"] / 2.0 + TRUE_PARAMS["beta"]
+        TRUE_PARAMS["alpha"] + TRUE_PARAMS["gamma"] * weight + TRUE_PARAMS["beta"]
     )
     unconditional = TRUE_PARAMS["omega"] / (1.0 - persistence)
     known = ModelFit(
@@ -218,3 +225,114 @@ def test_fit_recovers_known_parameters() -> None:
         TRUE_PARAMS["lambda"], abs=0.05
     )
     assert recovered.persistence == pytest.approx(persistence, abs=0.01)
+
+
+# --- leverage weight on gamma ----------------------------------------------
+
+
+def test_leverage_weight_is_a_half_only_when_symmetric() -> None:
+    """The gamma coefficient is E[z^2 1{z<0}], not P(z<0).
+
+    They agree at 1/2 for symmetric innovations, which is why the
+    textbook rule reads gamma/2. Under negative skew the partial second
+    moment rises above 1/2 while the probability of a negative shock
+    falls below it, so substituting the probability moves the weight in
+    the wrong direction.
+    """
+    assert _leverage_weight(6.0, 0.0) == pytest.approx(0.5, abs=1e-6)
+
+    for lam in (-0.10, -0.30, -0.50, -0.70):
+        weight = _leverage_weight(6.0, lam)
+        assert weight > 0.5, lam
+
+    # Monotone in the skew, and nowhere near the probability it replaced.
+    weights = [_leverage_weight(6.0, lam) for lam in (0.0, -0.1, -0.3, -0.5, -0.7)]
+    assert weights == sorted(weights)
+    assert _leverage_weight(5.75, -0.112) == pytest.approx(0.5424, abs=5e-4)
+
+
+def test_leverage_weight_matches_monte_carlo() -> None:
+    """Cross-check the closed form against draws from the same law."""
+    from arch.univariate import SkewStudent
+
+    rng = np.random.default_rng(0)
+    for nu, lam in ((6.0, -0.30), (5.75, -0.112)):
+        z = np.asarray(
+            SkewStudent().ppf(rng.random(2_000_000), parameters=np.array([nu, lam]))
+        )
+        empirical = float((z**2 * (z < 0)).mean())
+        assert _leverage_weight(nu, lam) == pytest.approx(empirical, abs=5e-3)
+
+
+@pytest.mark.parametrize("lam", [0.0, -0.30, -0.70])
+def test_unconditional_variance_matches_the_simulated_process(lam: float) -> None:
+    """The decisive test: does the formula predict the process it describes?
+
+    Simulated at low persistence so E[sigma^2] converges quickly, this
+    measures E[(r - mu)^2] — which equals E[sigma^2], since E[z^2] = 1 —
+    and checks the reported unconditional variance against it. The old
+    gamma/2 expression is wrong by up to 17% here; the parametrisation is
+    chosen so that error is far outside the tolerance.
+    """
+    params = {
+        "mu": 0.0,
+        "omega": 4.0e-6,
+        "alpha": 0.05,
+        "gamma": 0.10,
+        "beta": 0.79,
+        "nu": 6.0,
+        "lambda": lam,
+    }
+    # Build from the module's OWN persistence, so a wrong weight in
+    # _persistence propagates into what is being asserted. Passing a
+    # locally computed value in would test the test, not the module.
+    probe = ModelFit(
+        params=params,
+        loglik=0.0,
+        aic=0.0,
+        bic=0.0,
+        last_variance=1.0,
+        forecast_variance=1.0,
+        unconditional_variance=1.0,
+    )
+    claimed = params["omega"] / (1.0 - probe.persistence)
+    fitted = ModelFit(
+        params=params,
+        loglik=0.0,
+        aic=0.0,
+        bic=0.0,
+        last_variance=claimed,
+        forecast_variance=claimed,
+        unconditional_variance=claimed,
+    )
+
+    paths = simulate(
+        fitted, horizon=400, n_paths=4000, seed=11, initial_var="unconditional"
+    )
+    measured = float(((paths - params["mu"]) ** 2)[:, 100:].mean())  # burn in
+    assert fitted.unconditional_variance == pytest.approx(measured, rel=0.02)
+
+    if lam != 0.0:
+        half = params["omega"] / (
+            1.0 - (params["alpha"] + params["gamma"] / 2.0 + params["beta"])
+        )
+        assert abs(half / measured - 1.0) > 0.03  # the old rule is clearly off
+
+
+def test_persistence_uses_the_partial_moment(fitted: ModelFit) -> None:
+    p = fitted.params
+    expected = p["alpha"] + p["gamma"] * fitted.leverage_weight + p["beta"]
+    assert fitted.persistence == pytest.approx(expected)
+    assert fitted.leverage_weight > 0.5  # Brent's innovations are left-skewed
+
+    half_rule = p["alpha"] + p["gamma"] / 2.0 + p["beta"]
+    assert fitted.persistence > half_rule  # the old rule understated it
+
+
+def test_fit_refuses_to_splice_gaps() -> None:
+    """A GARCH likelihood is adjacency-dependent; a hole must not close."""
+    rng = np.random.default_rng(0)
+    values = rng.normal(0.0, 0.02, 2000)
+    values[900:1000] = np.nan
+    with pytest.raises(ValueError, match="non-finite"):
+        fit(pd.Series(values))

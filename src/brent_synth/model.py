@@ -32,6 +32,7 @@ just 100x too big — so it is deliberately kept in one place.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
@@ -43,6 +44,36 @@ from arch.univariate import SkewStudent
 PERCENT = 100.0
 
 PARAM_NAMES = ("mu", "omega", "alpha", "gamma", "beta", "nu", "lambda")
+
+
+@lru_cache(maxsize=256)
+def _leverage_weight(nu: float, lam: float) -> float:
+    """E[z^2 1{z<0}] for the standardised skew-t: the weight on gamma.
+
+    Taking expectations through the GJR recursion,
+
+        E[sigma^2] = omega + alpha E[sigma^2] + gamma E[sigma^2] E[z^2 1{z<0}]
+                     + beta E[sigma^2]
+
+    so the coefficient gamma carries is the innovation's **partial second
+    moment** below zero, not the probability of a negative shock. The two
+    coincide at 1/2 for any symmetric unit-variance z, which is why the
+    textbook rule is written as gamma/2 — but these innovations are
+    deliberately skewed, and there the shortcut fails in both magnitude
+    and direction. At the fitted lambda = -0.112 the probability falls to
+    0.477 while this weight rises to 0.543, so reasoning from the
+    probability moves the weight the wrong way.
+    """
+    return float(SkewStudent().partial_moment(2, 0.0, parameters=np.array([nu, lam])))
+
+
+def _persistence(params: dict[str, float]) -> float:
+    """GJR persistence, alpha + gamma * E[z^2 1{z<0}] + beta."""
+    return (
+        params["alpha"]
+        + params["gamma"] * _leverage_weight(params["nu"], params["lambda"])
+        + params["beta"]
+    )
 
 
 @dataclass
@@ -74,15 +105,25 @@ class ModelFit:
 
     @property
     def persistence(self) -> float:
-        """GJR persistence, alpha + gamma/2 + beta.
+        """GJR persistence, alpha + gamma * E[z^2 1{z<0}] + beta.
 
-        The half-weight on gamma is the probability that a symmetric
-        shock is negative, so this is the expected decay rate of a
-        variance shock. Values below 1 mean the variance process is
-        stationary; oil sits very close to 1.
+        The expected decay rate of a variance shock, and the quantity
+        that decides stationarity: below 1 the variance process is
+        stationary and has the finite long-run level reported as
+        ``unconditional_variance``. Oil sits very close to 1.
+
+        The weight on gamma is the innovation's partial second moment
+        below zero — see :func:`_leverage_weight`. Under skewed
+        innovations it is not 1/2, and using 1/2 understates persistence
+        and so understates the long-run variance, by 21% on the Brent
+        fit.
         """
-        p = self.params
-        return p["alpha"] + p["gamma"] / 2.0 + p["beta"]
+        return _persistence(self.params)
+
+    @property
+    def leverage_weight(self) -> float:
+        """The weight gamma carries in :attr:`persistence`."""
+        return _leverage_weight(self.params["nu"], self.params["lambda"])
 
     @property
     def is_stationary(self) -> bool:
@@ -97,7 +138,18 @@ def fit(returns: pd.Series) -> ModelFit:
     unconditional variance, and the fitted arch result object.
     """
     values = np.asarray(returns, dtype="float64").ravel()
-    values = values[np.isfinite(values)]
+    n_missing = int((~np.isfinite(values)).sum())
+    if n_missing:
+        # A GARCH likelihood is built entirely from adjacency: every
+        # conditional variance is a function of the previous one. Dropping
+        # a gap splices its two sides together and the recursion carries
+        # the error forward through the whole sample, so refuse it here
+        # exactly as the diagnostics module does for autocorrelation.
+        raise ValueError(
+            f"Return series contains {n_missing} non-finite value(s). "
+            "The GARCH recursion depends on adjacency, so the gaps cannot "
+            "be dropped silently — handle them explicitly first."
+        )
     if values.size < 100:
         raise ValueError(f"Need at least 100 returns to fit, got {values.size}.")
 
@@ -122,7 +174,7 @@ def fit(returns: pd.Series) -> ModelFit:
         "lambda": float(raw["lambda"]),
     }
 
-    persistence = params["alpha"] + params["gamma"] / 2.0 + params["beta"]
+    persistence = _persistence(params)
     if persistence < 1.0:
         unconditional = params["omega"] / (1.0 - persistence)
     else:
@@ -187,7 +239,7 @@ def simulate(
       sigma_T^2, the variance of the final observed day; carrying that
       forward would replay the last day instead of moving past it.
     - ``'unconditional'`` — the stationary variance
-      omega / (1 - alpha - gamma/2 - beta). Paths start from the
+      omega / (1 - alpha - gamma * E[z^2 1{z<0}] - beta). Paths start from the
       long-run vol level, ignoring where the market happens to sit
       today.
 
